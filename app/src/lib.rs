@@ -11,6 +11,8 @@ use wasi::io::streams::StreamError;
 
 const WORKER: &str = "127.0.0.1:44317";
 const POLICY: &str = "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+// WASI's blocking-write-and-flush accepts up to 4 KiB per call.
+const STREAM_CHUNK: usize = 4096;
 
 #[derive(Deserialize)]
 struct Config {
@@ -135,7 +137,7 @@ fn to_worker(
         let writer = output.write()?;
         let mut size = 0;
         loop {
-            match input.blocking_read(4096) {
+            match input.blocking_read(STREAM_CHUNK as u64) {
                 Ok(bytes) => {
                     size += bytes.len();
                     if size > 4096 {
@@ -190,7 +192,7 @@ fn pipe(out: ResponseOutparam, incoming: wasi::http::types::IncomingResponse) {
     ResponseOutparam::set(out, Ok(response));
     if let Ok(writer) = output.write() {
         loop {
-            match input.blocking_read(65536) {
+            match input.blocking_read(STREAM_CHUNK as u64) {
                 Ok(bytes) if writer.blocking_write_and_flush(&bytes).is_ok() => {}
                 Err(StreamError::Closed) => break,
                 _ => return,
