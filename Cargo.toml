@@ -1,0 +1,7 @@
+[workspace]
+members = ["app", "worker"]
+resolver = "3"
+
+[profile.release]
+lto = true
+strip = true

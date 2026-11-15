@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf }}">
+  <title>YouTube Downloader · LOKI</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header><strong>LOKI</strong><span>@{{ username }}</span><button id="logout" type="button">Sign out</button></header>
+  <main>
+    <h1>YouTube Downloader</h1>
+    <p>Use videos you have permission to download.</p>
+    <form id="inspect">
+      <label for="url">YouTube video link</label>
+      <div class="row"><input id="url" name="url" type="url" placeholder="https://www.youtube.com/watch?v=…" maxlength="2048" required><button>Find qualities</button></div>
+    </form>
+    <form id="download" hidden>
+      <h2 id="title"></h2>
+      <label for="quality">Quality</label>
+      <div class="row"><select id="quality"></select><button>Prepare video</button></div>
+    </form>
+    <p id="status" role="status" aria-live="polite"></p>
+    <section aria-labelledby="history-heading">
+      <div class="row"><h2 id="history-heading">Your download history</h2><a href="/api/history/export" download>Export history</a><button id="clear" type="button">Clear history</button></div>
+      <ul id="history"></ul>
+    </section>
+  </main>
+</body>
+</html>

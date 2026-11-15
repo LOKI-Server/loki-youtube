@@ -1,0 +1,35 @@
+[package]
+name = "loki-youtube"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+loki-sdk = { version = "0.5.0", features = ["templates"] }
+askama = { version = "0.12", default-features = false }
+serde = { version = "1", features = ["derive"] }
+
+[package.metadata.loki]
+id = "youtube-downloader"
+name = "YouTube Downloader"
+description = "Prepare temporary downloads from YouTube using your LOKI account. Requires the separately installed local worker."
+health = "/health"
+capabilities = ["outbound"]
+outbound = ["127.0.0.1:44317"]
+
+[[package.metadata.loki.fields]]
+key = "worker-key"
+label = "Local worker key"
+kind = "secret"
+required = true
+
+[package.metadata.loki.limits]
+memory_mib = 48
+fuel = 5000000000
+timeout_seconds = 120
+concurrent_requests = 8
+request_bytes = 4096
