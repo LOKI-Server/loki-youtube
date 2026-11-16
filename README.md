@@ -11,14 +11,15 @@ shared key to accept requests from the app. Keep the worker port on loopback.
 
 ## Build
 
-Use LOKI and `cargo-loki` 0.6 or later. Install the WASI target and build both parts
+Use LOKI and `cargo-loki` 0.7.0 or later. Install the WASI target and build both parts
 from this repository's root.
 
 ```text
 rustup target add wasm32-wasip2
-cargo install cargo-loki --locked
+cargo install cargo-loki --version 0.7.0 --locked
+cargo update -p loki-sdk --precise 0.7.0
 cargo build --locked --release -p loki-youtube-worker
-cargo loki package -p loki-youtube
+cargo loki package -p loki-youtube --locked
 ```
 
 The executable is in `target/release/`. The package is written under
