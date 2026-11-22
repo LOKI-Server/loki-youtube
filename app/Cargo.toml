@@ -1,35 +1,35 @@
 [package]
-name = "loki-youtube"
-version = "0.1.0"
+name = "media-downloader"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-loki-sdk = { version = "0.7.0", features = ["templates"] }
+loki-sdk = { version = "0.9.0", features = ["templates"] }
 askama = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [package.metadata.loki]
-id = "youtube-downloader"
-name = "YouTube Downloader"
-description = "Prepare temporary downloads from YouTube using your LOKI account. Requires the separately installed local worker."
+id = "media-downloader"
+name = "Media Downloader"
+description = "Save videos and audio from YouTube and the other sites yt-dlp supports, using the yt-dlp installed on your server."
 health = "/health"
-capabilities = ["outbound"]
+roles = ["admin"]
+panel = true
+capabilities = ["outbound", "database", "storage"]
 outbound = ["127.0.0.1:44317"]
-
-[[package.metadata.loki.fields]]
-key = "worker-key"
-label = "Local worker key"
-kind = "secret"
-required = true
+schedules = [{ name = "maintain", every_minutes = 1 }]
 
 [package.metadata.loki.limits]
-memory_mib = 48
-fuel = 5000000000
+memory_mib = 96
+fuel = 10000000000
 timeout_seconds = 120
 concurrent_requests = 8
-request_bytes = 4096
+request_bytes = 16384
+storage_mib = 4096
+storage_entries = 4096

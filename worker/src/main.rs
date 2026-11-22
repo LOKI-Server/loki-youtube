@@ -1,4 +1,9 @@
-mod youtube;
+//! The Media Downloader worker: a small loopback service that runs the server's own
+//! yt-dlp (and ffmpeg, when installed) for the Media Downloader LOKI app.
+mod jobs;
+mod settings;
+mod tools;
+mod web;
 
 use axum::{
     Json,
@@ -6,112 +11,46 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use clap::{Parser, Subcommand};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    sync::Arc,
 };
-use tokio::sync::Semaphore;
 
-const ADDRESS: &str = "127.0.0.1:44317";
-const DEFAULT_LIMITS: &str = "limits.json";
+/// The address the LOKI app is allowed to reach. Keep it on loopback.
+pub const ADDRESS: &str = "127.0.0.1:44317";
+const KEY_FILE: &str = "worker-key.txt";
 
 #[derive(Parser)]
+#[command(version, about = "Runs yt-dlp for the Media Downloader LOKI app.")]
 struct Cli {
-    #[arg(long, env = "LOKI_YOUTUBE_DATA")]
+    /// Where the worker keeps its key, settings and in-progress downloads.
+    #[arg(long, env = "MEDIA_DOWNLOADER_DATA")]
     data_dir: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve the LOKI app on a loopback-only port.
-    Serve {
-        #[arg(long, env = "LOKI_YOUTUBE_KEY_FILE")]
-        key_file: PathBuf,
-        /// Read download limits from a JSON file.
-        #[arg(long)]
-        limits: Option<PathBuf>,
-    },
-    /// Check the sandbox and optionally inspect a video without saving it.
-    Check {
-        #[arg(long)]
-        video_url: Option<String>,
-    },
-    /// Generate a random key file for this worker and its LOKI app.
-    CreateKey { path: PathBuf },
-    #[cfg(windows)]
-    WorkerSid,
+    /// Run the worker (the default).
+    Serve,
+    /// Print the key to paste into the app's panel in LOKI.
+    Key,
+    /// Replace the key. The app needs the new one before it can connect again.
+    NewKey,
+    /// Show which yt-dlp, ffmpeg and Deno the worker would use.
+    Check,
 }
 
 #[derive(Clone)]
-struct State(Arc<Inner>);
+pub struct State(Arc<Inner>);
 
-struct Inner {
-    data: PathBuf,
-    db: sqlx::SqlitePool,
-    settings: youtube::Settings,
-    youtube: youtube::Jobs,
-    youtube_workers: Arc<Semaphore>,
-    key: String,
-    stopping: AtomicBool,
-    rates: Mutex<HashMap<(&'static str, String), (Instant, u32)>>,
-}
-
-impl State {
-    async fn open(data: PathBuf, settings: youtube::Settings, key: String) -> anyhow::Result<Self> {
-        let db = SqlitePoolOptions::new()
-            .max_connections(4)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(data.join("history.db"))
-                    .create_if_missing(true)
-                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-                    .busy_timeout(Duration::from_secs(5)),
-            )
-            .await?;
-        sqlx::raw_sql(include_str!("schema.sql"))
-            .execute(&db)
-            .await?;
-        youtube::recover(&data, &db).await?;
-        Ok(Self(Arc::new(Inner {
-            data,
-            db,
-            settings,
-            key,
-            youtube: youtube::Jobs::default(),
-            youtube_workers: Arc::new(Semaphore::new(2)),
-            stopping: AtomicBool::new(false),
-            rates: Mutex::new(HashMap::new()),
-        })))
-    }
-
-    fn rate(&self, operation: &'static str, user: &str) -> Result<()> {
-        let now = Instant::now();
-        let mut rates = self.0.rates.lock().unwrap();
-        rates.retain(|_, (until, _)| *until > now);
-        let key = (operation, user.to_owned());
-        if rates.len() >= 2048 && !rates.contains_key(&key) {
-            return Err(youtube::capacity_error());
-        }
-        let (_, count) = rates
-            .entry(key)
-            .or_insert((now + Duration::from_secs(600), 0));
-        if *count >= 12 {
-            return Err(Error::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "Too many requests. Try again shortly.",
-            ));
-        }
-        *count += 1;
-        Ok(())
-    }
+pub struct Inner {
+    pub data: PathBuf,
+    pub key: String,
+    pub settings: settings::Store,
+    pub jobs: jobs::Jobs,
+    pub tools: Arc<tools::Tools>,
 }
 
 #[tokio::main]
@@ -119,184 +58,156 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    match cli.command {
-        Command::CreateKey { path } => {
-            write_private(
-                &path,
-                format!("{}{}\n", id().replace('-', ""), id().replace('-', "")).as_bytes(),
-            )?;
-            println!("Worker key saved to {}", path.display());
+    let data = data_dir(cli.data_dir)?;
+    match cli.command.unwrap_or(Command::Serve) {
+        Command::Key => println!("{}", key(&data, false)?),
+        Command::NewKey => {
+            let key = key(&data, true)?;
+            println!("{key}\n\nPaste this key into the Media Downloader panel in LOKI, then restart the worker.");
         }
-        #[cfg(windows)]
-        Command::WorkerSid => println!("{}", youtube::worker_sid()?),
-        Command::Check { video_url } => {
-            let data = prepare(cli.data_dir)?;
-            let _lock = lock(&data)?;
-            let state = State::open(data, youtube::Settings::default(), String::new()).await?;
-            if let Some(url) = video_url {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&youtube::inspect_worker(&state, &url).await?)?
-                );
-            } else {
-                youtube::verify_worker(&state).await?;
-                println!("YouTube worker isolation checks passed.");
-            }
+        Command::Check => {
+            let settings = settings::Store::open(&data)?;
+            let status = tools::Tools::default().status(&settings.get()).await;
+            println!("{}", serde_json::to_string_pretty(&status)?);
         }
-        Command::Serve { key_file, limits } => {
-            let data = prepare(cli.data_dir)?;
-            let _lock = lock(&data)?;
-            let key = std::fs::read_to_string(key_file)?.trim().to_owned();
-            anyhow::ensure!(
-                key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()),
-                "Use a key made with create-key"
-            );
-            let limits = limits.unwrap_or_else(|| data.join(DEFAULT_LIMITS));
-            let settings = match std::fs::read(&limits) {
-                Ok(bytes) => serde_json::from_slice::<youtube::Settings>(&bytes)?,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && limits == data.join(DEFAULT_LIMITS) =>
-                {
-                    youtube::Settings::default()
-                }
-                Err(error) => return Err(error.into()),
-            };
-            settings.validate()?;
-            let state = State::open(data, settings, key).await?;
-            youtube::verify_worker(&state).await?;
-            let listener = tokio::net::TcpListener::bind(ADDRESS).await?;
-            let cleaner = tokio::spawn(youtube::maintain(state.clone()));
-            let shutdown = state.clone();
-            println!("LOKI YouTube worker listening on {ADDRESS}");
-            let result = axum::serve(listener, youtube::router(state))
-                .with_graceful_shutdown(async move {
-                    let _ = tokio::signal::ctrl_c().await;
-                    shutdown.0.stopping.store(true, Ordering::Release);
-                    youtube::stop_transfers(&shutdown);
-                })
-                .await;
-            cleaner.abort();
-            result?;
-        }
+        Command::Serve => serve(data).await?,
     }
     Ok(())
 }
 
-fn prepare(path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+async fn serve(data: PathBuf) -> anyhow::Result<()> {
+    let _lock = lock(&data)?;
+    let key = key(&data, false)?;
+    let settings = settings::Store::open(&data)?;
+    let state = State(Arc::new(Inner {
+        jobs: jobs::Jobs::open(&data)?,
+        tools: Arc::default(),
+        settings,
+        key: key.clone(),
+        data,
+    }));
+    let status = state.0.tools.status(&state.0.settings.get()).await;
+    let listener = tokio::net::TcpListener::bind(ADDRESS)
+        .await
+        .map_err(|error| anyhow::anyhow!("Could not listen on {ADDRESS}: {error}. Is another worker already running?"))?;
+    println!("Media Downloader worker {} is listening on {ADDRESS}.", env!("CARGO_PKG_VERSION"));
+    match &status.yt_dlp {
+        Some(tool) => println!("yt-dlp {} at {}", tool.version, tool.path),
+        None => println!("yt-dlp was not found. Install it, or set its path in {}.", settings::FILE),
+    }
+    match &status.ffmpeg {
+        Some(tool) => println!("ffmpeg {}", tool.version),
+        None => println!("ffmpeg was not found, so only files that already have sound and picture together are offered."),
+    }
+    println!("\nWorker key (paste it into the Media Downloader panel in LOKI):\n{key}\n");
+    let cleaner = tokio::spawn(jobs::maintain(state.clone()));
+    let stopping = state.clone();
+    axum::serve(listener, web::router(state))
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            stopping.0.jobs.cancel_all();
+        })
+        .await?;
+    cleaner.abort();
+    Ok(())
+}
+
+fn data_dir(path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     let path = path
         .or_else(|| {
-            directories::ProjectDirs::from("org", "LOKI", "YouTubeWorker")
+            directories::ProjectDirs::from("org", "LOKI", "MediaDownloader")
                 .map(|dirs| dirs.data_local_dir().to_owned())
         })
-        .ok_or_else(|| {
-            anyhow::anyhow!("Specify a private worker data directory with --data-dir")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("Choose a data directory with --data-dir"))?;
     std::fs::create_dir_all(&path)?;
-    let path = dunce::canonicalize(path)?;
-    anyhow::ensure!(
-        !path.join("loki.db").exists(),
-        "Choose a separate data directory for the worker"
-    );
-    private_directory(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    }
     Ok(path)
 }
 
+/// One worker per data directory, so two never share a spool.
 fn lock(data: &Path) -> anyhow::Result<std::fs::File> {
-    let lock = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .open(data.join("worker.lock"))?;
-    fs2::FileExt::try_lock_exclusive(&lock)
-        .map_err(|_| anyhow::anyhow!("A worker is already using this data directory"))?;
-    Ok(lock)
+    file.try_lock()
+        .map_err(|_| anyhow::anyhow!("Another worker is already using {}", data.display()))?;
+    Ok(file)
 }
 
-fn private_directory(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+/// The shared key, made on first use. `replace` makes a new one.
+fn key(data: &Path, replace: bool) -> anyhow::Result<String> {
+    let path = data.join(KEY_FILE);
+    if !replace && let Ok(text) = std::fs::read_to_string(&path) {
+        let key = text.trim().to_owned();
+        if valid_key(&key) {
+            return Ok(key);
+        }
     }
-    #[cfg(windows)]
-    let _ = path; // Use a directory inheriting the per-account ACL.
-    Ok(())
+    let key = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    write_private(&path, format!("{key}\n").as_bytes())?;
+    Ok(key)
+}
+
+pub fn valid_key(key: &str) -> bool {
+    key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
+    use std::io::Write;
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
 }
 
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
+pub type Result<T> = std::result::Result<T, Error>;
 
-fn id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
-type Result<T> = std::result::Result<T, Error>;
-
+/// An answer the app shows people as it is, so messages are written for them.
 #[derive(Debug)]
-struct Error {
-    status: StatusCode,
-    message: String,
+pub struct Error {
+    pub status: StatusCode,
+    pub message: String,
 }
 
 impl Error {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            message: message.into(),
-        }
+    pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self { status, message: message.into() }
     }
-    fn bad(message: &str) -> Self {
+    pub fn bad(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
-    fn forbidden() -> Self {
-        Self::new(StatusCode::FORBIDDEN, "Access denied.")
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, message)
     }
-    fn not_found() -> Self {
-        Self::new(StatusCode::NOT_FOUND, "Download not found.")
+    pub fn not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "That download is no longer on the worker.")
     }
 }
 
-impl<E> From<E> for Error
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
+impl<E: std::error::Error + Send + Sync + 'static> From<E> for Error {
     fn from(error: E) -> Self {
-        tracing::warn!(%error, "worker request failed");
-        Self::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "The worker could not complete this request.",
-        )
+        tracing::warn!(%error, "request failed");
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "The worker could not finish this request.")
     }
 }
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({"error": self.message})),
-        )
-            .into_response()
+        (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()
     }
 }

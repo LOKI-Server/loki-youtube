@@ -4,28 +4,51 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="csrf-token" content="{{ csrf }}">
-  <title>YouTube Downloader · LOKI</title>
+  <meta name="color-scheme" content="dark">
+  <title>Media Downloader · LOKI</title>
   <link rel="stylesheet" href="/app.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <header><strong>LOKI</strong><span>@{{ username }}</span><button id="logout" type="button">Sign out</button></header>
+  <header class="top">
+    <div class="brand"><span class="mark" aria-hidden="true">ᛉ</span><span>Media Downloader</span></div>
+    <div class="who"><span>{{ name }}</span><button id="logout" type="button" class="ghost">Sign out</button></div>
+  </header>
   <main>
-    <h1>YouTube Downloader</h1>
-    <p>Use videos you have permission to download.</p>
-    <form id="inspect">
-      <label for="url">YouTube video link</label>
-      <div class="row"><input id="url" name="url" type="url" placeholder="https://www.youtube.com/watch?v=…" maxlength="2048" required><button>Find qualities</button></div>
-    </form>
-    <form id="download" hidden>
-      <h2 id="title"></h2>
-      <label for="quality">Quality</label>
-      <div class="row"><select id="quality"></select><button>Prepare video</button></div>
-    </form>
-    <p id="status" role="status" aria-live="polite"></p>
-    <section aria-labelledby="history-heading">
-      <div class="row"><h2 id="history-heading">Your download history</h2><a href="/api/history/export" download>Export history</a><button id="clear" type="button">Clear history</button></div>
-      <ul id="history"></ul>
+    <section class="card find">
+      <h1>Save a video or song</h1>
+      <p class="muted">Paste a link from YouTube or any other site yt-dlp supports. Only save media you have the right to keep.</p>
+      <form id="inspect" autocomplete="off">
+        <label class="visually-hidden" for="url">Link</label>
+        <div class="row">
+          <input id="url" name="url" type="url" inputmode="url" placeholder="https://www.youtube.com/watch?v=…" maxlength="2048" required>
+          <button type="submit" class="primary">Find</button>
+        </div>
+      </form>
+      <p id="status" role="status" aria-live="polite"></p>
+      <form id="choose" hidden>
+        <div class="video">
+          <h2 id="title"></h2>
+          <p id="details" class="muted"></p>
+        </div>
+        <fieldset>
+          <legend>Quality</legend>
+          <div id="choices" class="choices"></div>
+        </fieldset>
+        <div class="row end"><button type="button" id="cancel-choice" class="ghost">Cancel</button><button type="submit" class="primary">Download</button></div>
+      </form>
+    </section>
+
+    <section class="card" aria-labelledby="list-heading">
+      <div class="row between">
+        <h2 id="list-heading">Your downloads</h2>
+        <div class="row tight">
+          <a class="ghost button" href="/api/downloads/export" download>Export</a>
+          <button id="clear" type="button" class="ghost">Clear finished</button>
+        </div>
+      </div>
+      <p class="muted small" id="keep"></p>
+      <ul id="list" class="list"></ul>
     </section>
   </main>
 </body>

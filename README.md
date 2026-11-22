@@ -1,104 +1,108 @@
-# YouTube Downloader for LOKI
+# Media Downloader for LOKI
 
-An installable LOKI app for videos you have permission to download. Users sign
-in through LOKI, pick an available source quality, and collect prepared videos
-before the countdown expires. The app keeps private, exportable metadata history.
+Save videos and audio from YouTube and the thousands of other sites
+[yt-dlp](https://github.com/yt-dlp/yt-dlp) supports, from your own LOKI server.
+People paste a link, pick a quality from 144p up to 4K or audio only, and save the
+finished file. Only download media you have the right to keep.
 
-This project builds a portable `.loki-app` and a native worker for the same
-server. The WASI app handles the browser UI and uses LOKI's existing account and
-access controls. The separately installed worker uses `127.0.0.1:44317` and a
-shared key to accept requests from the app. Keep the worker port on loopback.
+It has two parts:
+
+- **The LOKI app** (`app/`, a `.loki-app`): the page people use, and a panel in
+  LOKI's dashboard where the owner connects the worker, sees yt-dlp's status,
+  updates it, and sets limits.
+- **The worker** (`worker/`, `media-downloader-worker`): a small program on the
+  same computer as LOKI that runs the server's yt-dlp. LOKI apps can't start
+  programs themselves, so the worker does that and listens only on
+  `127.0.0.1:44317`, with a key only the app knows.
+
+## Set up
+
+1. **Install yt-dlp** on the server so it's on the PATH. Also install:
+   - **ffmpeg**, to offer 1080p and higher. Most sites, YouTube included, send
+     video and sound separately at high quality, and ffmpeg joins them. Without
+     it, only files that already have both are offered, which on YouTube means
+     360p.
+   - **Deno**, which yt-dlp needs to read YouTube's videos.
+
+   On Windows, `winget install yt-dlp.yt-dlp`, `winget install Gyan.FFmpeg` and
+   `winget install DenoLand.Deno`.
+   On Linux and macOS, use your package manager or the projects' own releases.
+   The standalone yt-dlp release can update itself from the panel.
+
+2. **Run the worker** as the account that should own the downloads:
+
+   ```text
+   media-downloader-worker
+   ```
+
+   On its first start it makes a key and prints it, along with the yt-dlp,
+   ffmpeg and Deno it found. `media-downloader-worker key` prints the key again,
+   and `media-downloader-worker check` shows the tools without starting.
+   Keep it running, for example with Task Scheduler at sign-in, a systemd user
+   service or launchd.
+
+3. **Import the app** in LOKI's **Applications**, grant access to the people or
+   groups who should use it, and enable it.
+
+4. Open the app's **panel** in LOKI and paste the worker key. The panel then
+   shows the worker, yt-dlp (and whether a newer version is out), ffmpeg and
+   Deno, with **Update yt-dlp** and **Check again** buttons.
+
+The server owner is always an admin of the app. Give others the app's `admin`
+role to let them manage the panel too.
+
+## Limits
+
+Set these in the panel:
+
+| Limit | Default |
+| --- | --- |
+| Longest video | 180 minutes |
+| Largest file | 2048 MB |
+| Downloads at once (whole server) | 2 |
+| Worker space for downloads in progress | 8192 MB |
+| Keep finished files ready for | 60 minutes |
+
+Each person can have three downloads in progress at a time. Finished files wait
+in the app's storage on LOKI until they're saved or expire. That storage counts
+against the app's quota, 4096 MB unless you change it from **Manage** in
+Applications.
+
+## How it works
+
+The worker runs yt-dlp with `--ignore-config`, never follows playlists, and
+leaves out yt-dlp's generic extractor, so only sites yt-dlp specifically
+supports work. Links whose host resolves to the server itself or its local
+network are refused.
+
+LOKI gives an app request two minutes, which isn't enough to stream a large video
+through it. So when the worker finishes, the app copies the file into its own
+storage on LOKI a few megabytes at a time. This happens while the page is open,
+and every minute in the background otherwise. LOKI then serves the file itself,
+as an ordinary download that can resume and has no time limit.
+
+The worker keeps its key, `settings.json` and in-progress downloads in its data
+folder: `%LOCALAPPDATA%\LOKI\MediaDownloader\data` on Windows, and the usual local
+data folder elsewhere. `--data-dir` or `MEDIA_DOWNLOADER_DATA` chooses another.
+To use a yt-dlp or ffmpeg that isn't on the PATH, add `"yt_dlp"` or `"ffmpeg"`
+with its full path to `settings.json`. Downloads in progress are dropped when the
+worker restarts.
 
 ## Build
 
-Use LOKI and `cargo-loki` 0.7.0 or later. Install the WASI target and build both parts
-from this repository's root.
-
 ```text
 rustup target add wasm32-wasip2
-cargo install cargo-loki --version 0.7.0 --locked
-cargo update -p loki-sdk --precise 0.7.0
-cargo build --locked --release -p loki-youtube-worker
-cargo loki package -p loki-youtube --locked
+cargo install cargo-loki --version 0.9.0 --locked
+cargo build --release -p media-downloader-worker
+cargo loki package -p media-downloader
 ```
 
-The executable is in `target/release/`. The package is written under
-`target/loki/`.
+The worker is `target/release/media-downloader-worker` and the app is
+`target/loki/media-downloader-0.2.0.loki-app`. The app needs LOKI 0.9 or later.
 
-## Provision the worker
+## Upgrading from the YouTube Downloader
 
-Set up a private data directory for the worker under its OS account. Provision a
-separate read-only runtime directory with current CPython 3.11 or newer and Deno
-2.9.8 or newer. The runtime layout is `bin/python3` and `bin/deno` on Unix,
-`bin/python.exe` and `bin/deno.exe` on Windows, and `packages/` on every OS.
-Include the complete Python standard library and any required shared libraries.
-Install the pinned dependencies with the Python used to provision the runtime.
-
-```text
-python -m pip install --only-binary=:all: --no-deps --require-hashes -r packaging/youtube-requirements.txt --target RUNTIME/packages
-```
-
-- **Windows** uses a no-capability AppContainer and a Job Object. Run
-  `loki-youtube-worker.exe worker-sid` as the account that will run the worker.
-  Grant the returned SID read and execute access to the runtime and its contents
-  with `icacls RUNTIME /grant "*SID:(OI)(CI)(RX)" /T`. Keep the data directory
-  private to the worker account. The AppContainer needs zero loopback exemptions.
-- **Linux** uses Bubblewrap with unprivileged user namespaces, a separate network
-  namespace, and a small temporary filesystem. Bubblewrap defaults to
-  `/usr/bin/bwrap`. Set `LOKI_BWRAP_EXECUTABLE` to an absolute path to select
-  another installation. The runtime needs to work read-only at `/worker`.
-- **macOS** requires a CPython helper signed with the
-  `com.apple.security.app-sandbox` entitlement and a Deno child signed with
-  `com.apple.security.app-sandbox` and `com.apple.security.inherit`. Both must pass
-  strict signature verification. [Apple's helper signing guide](https://developer.apple.com/documentation/xcode/embedding-a-helper-tool-in-a-sandboxed-app)
-
-Set `LOKI_YOUTUBE_RUNTIME` to the absolute runtime directory. With the worker
-stopped, run its isolation check and generate the key. Replace `DATA` and
-`PRIVATE_KEY_FILE` with your paths.
-
-```text
-loki-youtube-worker --data-dir DATA check
-loki-youtube-worker create-key PRIVATE_KEY_FILE
-loki-youtube-worker --data-dir DATA serve --key-file PRIVATE_KEY_FILE
-```
-
-The worker checks isolation again at startup. The sandboxed extractor cannot
-connect directly to the network. Its broker permits only approved YouTube HTTPS
-hosts, pins public DNS results, and checks redirects. `check --video-url URL`
-also probes a particular video for supported qualities without saving it.
-
-## Install in LOKI
-
-1. In **Applications**, import `youtube-downloader-0.1.0.loki-app` and review its
-   outbound permission for `127.0.0.1:44317`.
-2. Open **Manage**, enter the key file's contents in **Local worker key**, and
-   save. Keep access restricted to selected accounts or groups, or choose Members
-   for all approved LOKI accounts.
-3. Enable and open the app. A hostname is optional for local use. For public
-   hosting, configure the app hostname and HTTPS through LOKI's usual proxy.
-
-## Limits and history
-
-To configure limits, save this JSON as `DATA/limits.json` and restart the worker.
-`serve --limits PATH` selects a different file. These are the defaults.
-
-```json
-{
-  "duration_minutes": 60,
-  "file_mib": 512,
-  "total_mib": 2048,
-  "pickup_seconds": 300
-}
-```
-
-The temporary spool and active jobs share the configured total. The file limit
-may be set up to 1 GiB, which fits LOKI's WASI streaming limit. LOKI also limits
-each individual delivery request to 120 seconds. A partially transferred file
-can be resumed by a new ranged request during the pickup window. Transfers that
-start within the window have up to five minutes of worker-side cleanup grace.
-
-The app offers source formats that already contain both audio and video. The
-worker deletes temporary video files after expiry and on startup. It keeps at
-most 30 days and 500 entries of metadata per account. Users can export or clear
-their history from the app. Back up the worker's `history.db` separately with
-the worker stopped if you want to retain history across server moves.
+This replaces the earlier YouTube Downloader app and its sandboxed worker.
+It has a new app ID, so import it as a new app, and remove the old app and
+worker. The repository can be renamed to `media-downloader` on GitHub; local
+clones keep working once their remote is updated.
