@@ -46,7 +46,10 @@ fn keep_default() -> u32 {
 }
 impl Default for Config {
     fn default() -> Self {
-        Self { key: String::new(), keep_minutes: keep_default() }
+        Self {
+            key: String::new(),
+            keep_minutes: keep_default(),
+        }
     }
 }
 fn config() -> Result<Config> {
@@ -55,7 +58,12 @@ fn config() -> Result<Config> {
 
 // ---- The worker ---------------------------------------------------------------
 
-fn call(method: &str, path: &str, body: Option<&Value>, range: Option<(u64, u64)>) -> Result<fetch::Fetched> {
+fn call(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    range: Option<(u64, u64)>,
+) -> Result<fetch::Fetched> {
     let key = config()?.key;
     if key.is_empty() {
         return Err(Error::new(503, NOT_SET_UP));
@@ -75,7 +83,11 @@ fn call(method: &str, path: &str, body: Option<&Value>, range: Option<(u64, u64)
             .and_then(|value| value["error"].as_str().map(str::to_owned))
             .unwrap_or_else(|| format!("The worker answered {}.", fetched.status));
         // A wrong key is a setup problem, not the person's.
-        let status = if fetched.status == 403 { 503 } else { fetched.status };
+        let status = if fetched.status == 403 {
+            503
+        } else {
+            fetched.status
+        };
         return Err(Error::new(status, message));
     }
     Ok(fetched)
@@ -83,7 +95,8 @@ fn call(method: &str, path: &str, body: Option<&Value>, range: Option<(u64, u64)
 
 fn worker(method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
     let fetched = call(method, path, body, None)?;
-    serde_json::from_slice(&fetched.body).map_err(|_| Error::new(502, "The worker answered something unexpected."))
+    serde_json::from_slice(&fetched.body)
+        .map_err(|_| Error::new(502, "The worker answered something unexpected."))
 }
 
 // ---- Downloads -----------------------------------------------------------------
@@ -107,14 +120,18 @@ struct Download {
     expires: Option<i64>,
 }
 
-const COLUMNS: &str = "id,url,title,site,quality,job,status,percent,ext,size,received,error,created,expires";
+const COLUMNS: &str =
+    "id,url,title,site,quality,job,status,percent,ext,size,received,error,created,expires";
 
 fn health(_: Request) -> Result<Response> {
     Database.execute(
         "CREATE TABLE IF NOT EXISTS downloads(id TEXT PRIMARY KEY,user_id TEXT NOT NULL,url TEXT NOT NULL,title TEXT NOT NULL,site TEXT NOT NULL DEFAULT '',quality TEXT NOT NULL,job TEXT,status TEXT NOT NULL,percent REAL,ext TEXT,size INTEGER,received INTEGER NOT NULL DEFAULT 0,error TEXT,created INTEGER NOT NULL,expires INTEGER,claim INTEGER)",
         params![],
     )?;
-    Database.execute("CREATE INDEX IF NOT EXISTS downloads_user ON downloads(user_id,created)", params![])?;
+    Database.execute(
+        "CREATE INDEX IF NOT EXISTS downloads_user ON downloads(user_id,created)",
+        params![],
+    )?;
     Ok(Response::text("ready"))
 }
 
@@ -131,15 +148,39 @@ fn forget_files(id: &str) {
 
 fn owned(id: &str, user: &str) -> Result<Download> {
     Database
-        .fetch_optional(&format!("SELECT {COLUMNS} FROM downloads WHERE id=? AND user_id=?"), params![id, user])?
+        .fetch_optional(
+            &format!("SELECT {COLUMNS} FROM downloads WHERE id=? AND user_id=?"),
+            params![id, user],
+        )?
         .ok_or_else(|| Error::not_found("That download isn't in your list."))
 }
 
+/// Marks a download in progress as failed. One the person cancelled stays cancelled.
 fn mark_failed(id: &str, message: &str) -> Result<()> {
     Database.execute(
-        "UPDATE downloads SET status='failed',error=?,percent=NULL,claim=NULL WHERE id=?",
+        &format!("UPDATE downloads SET status='failed',error=?,percent=NULL,claim=NULL WHERE id=? AND status IN {ACTIVE}"),
         params![message, id],
     )?;
+    Ok(())
+}
+
+/// Downloads in progress for longer than this are given up on: the worker keeps
+/// uncollected files for six hours, so anything older has stopped for good.
+const STALE_SECONDS: i64 = 12 * 3600;
+/// A download that never got a worker job (the start was interrupted).
+const UNSTARTED_SECONDS: i64 = 600;
+
+/// Fails downloads that stopped making progress, such as when the worker is gone.
+fn give_up(user: Option<&str>) -> Result<()> {
+    let now = now();
+    let stuck: Vec<Id> = Database.fetch_all(
+        &format!("SELECT id FROM downloads WHERE status IN {ACTIVE} AND (created<? OR (job IS NULL AND created<?)) AND (?3 IS NULL OR user_id=?3)"),
+        params![now - STALE_SECONDS, now - UNSTARTED_SECONDS, user],
+    )?;
+    for Id { id } in stuck {
+        forget_files(&id);
+        mark_failed(&id, "The download stopped making progress. Start it again.")?;
+    }
     Ok(())
 }
 
@@ -152,7 +193,10 @@ fn refresh(row: &Download) -> Result<()> {
     let view = match worker("GET", &format!("/jobs/{job}"), None) {
         Ok(view) => view,
         Err(error) if error.status() == 404 => {
-            return mark_failed(&row.id, "The worker restarted before this finished. Start it again.");
+            return mark_failed(
+                &row.id,
+                "The worker restarted before this finished. Start it again.",
+            );
         }
         // The worker may just be restarting; try again on the next check.
         Err(_) => return Ok(()),
@@ -160,18 +204,21 @@ fn refresh(row: &Download) -> Result<()> {
     match view["status"].as_str() {
         Some(status @ ("downloading" | "processing")) => {
             Database.execute(
-                "UPDATE downloads SET status=?,percent=? WHERE id=?",
+                "UPDATE downloads SET status=?,percent=? WHERE id=? AND status IN ('downloading','processing')",
                 params![status, view["percent"].as_f64(), row.id],
             )?;
         }
         Some("ready") => {
             Database.execute(
-                "UPDATE downloads SET status='collecting',percent=0,size=?,ext=? WHERE id=?",
+                "UPDATE downloads SET status='collecting',percent=0,size=?,ext=? WHERE id=? AND status IN ('downloading','processing')",
                 params![view["size"].as_i64(), view["ext"].as_str().unwrap_or("bin"), row.id],
             )?;
         }
         Some("cancelled") => {
-            Database.execute("UPDATE downloads SET status='cancelled',percent=NULL WHERE id=?", params![row.id])?;
+            Database.execute(
+                "UPDATE downloads SET status='cancelled',percent=NULL WHERE id=? AND status IN ('downloading','processing')",
+                params![row.id],
+            )?;
         }
         _ => {
             let message = view["error"].as_str().unwrap_or("The download failed.");
@@ -199,7 +246,10 @@ fn collect(id: &str) -> Result<()> {
 }
 
 fn copy(id: &str, started: i64) -> Result<()> {
-    let row: Download = Database.fetch_one(&format!("SELECT {COLUMNS} FROM downloads WHERE id=?"), params![id])?;
+    let row: Download = Database.fetch_one(
+        &format!("SELECT {COLUMNS} FROM downloads WHERE id=?"),
+        params![id],
+    )?;
     let (Some(job), Some(size)) = (&row.job, row.size) else {
         return mark_failed(id, "The worker didn't say how large the file is.");
     };
@@ -213,11 +263,19 @@ fn copy(id: &str, started: i64) -> Result<()> {
     };
     while received < size && now() - started < COLLECT_SECONDS {
         let end = (received + RANGE).min(size) - 1;
-        let fetched = match call("GET", &format!("/jobs/{job}/file"), None, Some((received, end))) {
+        let fetched = match call(
+            "GET",
+            &format!("/jobs/{job}/file"),
+            None,
+            Some((received, end)),
+        ) {
             Ok(fetched) => fetched,
             Err(error) if error.status() == 404 => {
                 forget_files(id);
-                return mark_failed(id, "The worker no longer has this file. Start the download again.");
+                return mark_failed(
+                    id,
+                    "The worker no longer has this file. Start the download again.",
+                );
             }
             Err(error) => return Err(error),
         };
@@ -239,18 +297,26 @@ fn copy(id: &str, started: i64) -> Result<()> {
             }
         }
         received = end + 1;
-        Database.execute(
-            "UPDATE downloads SET received=?,percent=? WHERE id=?",
+        let still = Database.execute(
+            "UPDATE downloads SET received=?,percent=? WHERE id=? AND status='collecting'",
             params![received as i64, received as f64 * 100.0 / size as f64, id],
         )?;
+        if still == 0 {
+            // Cancelled meanwhile: drop what this copy wrote after the cancel.
+            forget_files(id);
+            return Ok(());
+        }
     }
     if received >= size {
         Storage.rename(&path, &finished(id), true)?;
         let keep = i64::from(config()?.keep_minutes) * 60;
-        Database.execute(
-            "UPDATE downloads SET status='ready',percent=100,received=?,expires=? WHERE id=?",
+        let ready = Database.execute(
+            "UPDATE downloads SET status='ready',percent=100,received=?,expires=? WHERE id=? AND status='collecting'",
             params![size as i64, now() + keep, id],
         )?;
+        if ready == 0 {
+            forget_files(id);
+        }
         let _ = call("DELETE", &format!("/jobs/{job}"), None, None);
     }
     Ok(())
@@ -258,10 +324,16 @@ fn copy(id: &str, started: i64) -> Result<()> {
 
 /// Removes saved files whose time is up.
 fn expire() -> Result<()> {
-    let ids: Vec<Id> = Database.fetch_all("SELECT id FROM downloads WHERE status='ready' AND expires<?", params![now()])?;
+    let ids: Vec<Id> = Database.fetch_all(
+        "SELECT id FROM downloads WHERE status='ready' AND expires<?",
+        params![now()],
+    )?;
     for Id { id } in ids {
         forget_files(&id);
-        Database.execute("UPDATE downloads SET status='expired',percent=NULL WHERE id=?", params![id])?;
+        Database.execute(
+            "UPDATE downloads SET status='expired',percent=NULL WHERE id=?",
+            params![id],
+        )?;
     }
     Ok(())
 }
@@ -278,7 +350,11 @@ fn api(result: Result<Value>) -> Result<Response> {
     match result {
         Ok(value) => Ok(Response::json(&value)?.header("cache-control", "no-store")?),
         Err(error) => {
-            let message = if error.status() == 500 { "Something went wrong. Try again." } else { error.message() };
+            let message = if error.status() == 500 {
+                "Something went wrong. Try again."
+            } else {
+                error.message()
+            };
             Ok(Response::json(&json!({"error": message}))?.with_status(error.status()))
         }
     }
@@ -307,38 +383,63 @@ fn start(mut request: Request) -> Result<Response> {
     }
     let input: Input = request.json(8192)?;
     api((|| {
-        let clean = |text: &str, limit: usize| -> String { text.chars().filter(|c| !c.is_control()).take(limit).collect::<String>().trim().to_owned() };
+        let clean = |text: &str, limit: usize| -> String {
+            text.chars()
+                .filter(|c| !c.is_control())
+                .take(limit)
+                .collect::<String>()
+                .trim()
+                .to_owned()
+        };
         if input.url.len() > 2048 || input.choice.len() > 16 {
             return Err(Error::bad("Look up the link again, then choose a quality."));
         }
-        let active: i64 = Database.fetch_one::<Count>(
-            &format!("SELECT count(*) AS n FROM downloads WHERE user_id=? AND status IN {ACTIVE}"),
-            params![user],
-        )?.n;
-        if active >= ACTIVE_PER_PERSON {
-            return Err(Error::new(429, format!("You already have {ACTIVE_PER_PERSON} downloads in progress. Wait for one to finish.")));
-        }
-        let job = worker("POST", "/jobs", Some(&json!({"url": input.url, "choice": input.choice})))?;
-        let job = job["id"].as_str().ok_or_else(|| Error::new(502, "The worker didn't start the download."))?;
         let id = loki_sdk::random_id();
-        let title = Some(clean(&input.title, 300)).filter(|t| !t.is_empty()).unwrap_or_else(|| "Untitled".into());
-        Database.execute(
-            "INSERT INTO downloads(id,user_id,url,title,site,quality,job,status,received,created) VALUES(?,?,?,?,?,?,?,'downloading',0,?)",
-            params![id, user, input.url, title, clean(&input.site, 80), clean(&input.quality, 40), job, now()],
+        let title = Some(clean(&input.title, 300))
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Untitled".into());
+        // Counting and inserting in one statement, so two requests at once can't
+        // both slip under the limit. The row waits for its worker job below.
+        let reserved = Database.execute(
+            &format!("INSERT INTO downloads(id,user_id,url,title,site,quality,status,received,created) SELECT ?1,?2,?3,?4,?5,?6,'downloading',0,?7 WHERE (SELECT count(*) FROM downloads WHERE user_id=?2 AND status IN {ACTIVE})<?8"),
+            params![id, user, input.url, title, clean(&input.site, 80), clean(&input.quality, 40), now(), ACTIVE_PER_PERSON],
         )?;
+        if reserved == 0 {
+            return Err(Error::new(
+                429,
+                format!(
+                    "You already have {ACTIVE_PER_PERSON} downloads in progress. Wait for one to finish."
+                ),
+            ));
+        }
+        let job = worker(
+            "POST",
+            "/jobs",
+            Some(&json!({"url": input.url, "choice": input.choice})),
+        )
+        .and_then(|job| {
+            job["id"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| Error::new(502, "The worker didn't start the download."))
+        });
+        let job = match job {
+            Ok(job) => job,
+            Err(error) => {
+                Database.execute("DELETE FROM downloads WHERE id=?", params![id])?;
+                return Err(error);
+            }
+        };
+        Database.execute("UPDATE downloads SET job=? WHERE id=?", params![job, id])?;
         Ok(serde_json::to_value(owned(&id, &user)?)?)
     })())
-}
-
-#[derive(Deserialize)]
-struct Count {
-    n: i64,
 }
 
 fn list(request: Request) -> Result<Response> {
     let user = request.context().require_user()?.id.clone();
     api((|| {
         expire()?;
+        give_up(Some(&user))?;
         let active: Vec<Download> = Database.fetch_all(
             &format!("SELECT {COLUMNS} FROM downloads WHERE user_id=? AND status IN ('downloading','processing')"),
             params![user],
@@ -347,7 +448,9 @@ fn list(request: Request) -> Result<Response> {
             refresh(row)?;
         }
         let items: Vec<Download> = Database.fetch_all(
-            &format!("SELECT {COLUMNS} FROM downloads WHERE user_id=? ORDER BY created DESC LIMIT 100"),
+            &format!(
+                "SELECT {COLUMNS} FROM downloads WHERE user_id=? ORDER BY created DESC LIMIT 100"
+            ),
             params![user],
         )?;
         Ok(json!({"items": items, "now": now(), "keep_minutes": config()?.keep_minutes}))
@@ -370,13 +473,22 @@ fn remove(request: Request) -> Result<Response> {
     api((|| {
         let row = owned(&id, &user)?;
         if let Some(job) = &row.job
-            && matches!(row.status.as_str(), "downloading" | "processing" | "collecting")
+            && matches!(
+                row.status.as_str(),
+                "downloading" | "processing" | "collecting"
+            )
         {
             let _ = call("DELETE", &format!("/jobs/{job}"), None, None);
         }
         forget_files(&id);
-        if matches!(row.status.as_str(), "downloading" | "processing" | "collecting") {
-            Database.execute("UPDATE downloads SET status='cancelled',percent=NULL,claim=NULL WHERE id=?", params![id])?;
+        if matches!(
+            row.status.as_str(),
+            "downloading" | "processing" | "collecting"
+        ) {
+            Database.execute(
+                "UPDATE downloads SET status='cancelled',percent=NULL,claim=NULL WHERE id=?",
+                params![id],
+            )?;
         } else {
             Database.execute("DELETE FROM downloads WHERE id=?", params![id])?;
         }
@@ -387,11 +499,17 @@ fn remove(request: Request) -> Result<Response> {
 fn clear(request: Request) -> Result<Response> {
     let user = request.context().require_user()?.id.clone();
     api((|| {
-        let ids: Vec<Id> = Database.fetch_all(&format!("SELECT id FROM downloads WHERE user_id=? AND status NOT IN {ACTIVE}"), params![user])?;
+        let ids: Vec<Id> = Database.fetch_all(
+            &format!("SELECT id FROM downloads WHERE user_id=? AND status NOT IN {ACTIVE}"),
+            params![user],
+        )?;
         for Id { id } in &ids {
             forget_files(id);
         }
-        Database.execute(&format!("DELETE FROM downloads WHERE user_id=? AND status NOT IN {ACTIVE}"), params![user])?;
+        Database.execute(
+            &format!("DELETE FROM downloads WHERE user_id=? AND status NOT IN {ACTIVE}"),
+            params![user],
+        )?;
         Ok(json!({"ok": true, "removed": ids.len()}))
     })())
 }
@@ -406,8 +524,10 @@ fn export(request: Request) -> Result<Response> {
         .into_iter()
         .map(|d| json!({"title": d.title, "url": d.url, "site": d.site, "quality": d.quality, "status": d.status, "size": d.size, "created": d.created}))
         .collect();
-    Response::json(&json!({"downloads": history}))?
-        .header("content-disposition", "attachment; filename=\"media-downloads.json\"")
+    Response::json(&json!({"downloads": history}))?.header(
+        "content-disposition",
+        "attachment; filename=\"media-downloads.json\"",
+    )
 }
 
 /// A finished file, which LOKI streams itself, with resuming and no time limit.
@@ -415,7 +535,9 @@ fn file(request: Request) -> Result<Response> {
     let user = request.context().require_user()?.id.clone();
     let row = owned(request.param("id")?, &user)?;
     if row.status != "ready" || row.expires.is_none_or(|expires| expires < now()) {
-        return Err(Error::not_found("This file has expired. Download it again."));
+        return Err(Error::not_found(
+            "This file has expired. Download it again.",
+        ));
     }
     let name = filename(&row.title, row.ext.as_deref().unwrap_or("bin"));
     Storage.file(finished(&row.id)).download(&name)
@@ -425,29 +547,49 @@ fn file(request: Request) -> Result<Response> {
 fn filename(title: &str, ext: &str) -> String {
     let stem: String = title
         .chars()
-        .map(|c| if c.is_control() || r#"\/:*?"<>|"#.contains(c) { '_' } else { c })
+        .map(|c| {
+            if c.is_control() || r#"\/:*?"<>|"#.contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
         .take(120)
         .collect();
     let stem = stem.trim().trim_matches('.');
-    let ext: String = ext.chars().filter(char::is_ascii_alphanumeric).take(8).collect();
-    format!("{}.{}", if stem.is_empty() { "download" } else { stem }, if ext.is_empty() { "bin" } else { &ext })
+    let ext: String = ext
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(8)
+        .collect();
+    format!(
+        "{}.{}",
+        if stem.is_empty() { "download" } else { stem },
+        if ext.is_empty() { "bin" } else { &ext }
+    )
 }
 
 /// Every minute: expire old files, follow downloads in progress, and keep copying
 /// finished ones even when nobody has the page open.
 fn maintain(_: Request) -> Result<Response> {
     expire()?;
+    give_up(None)?;
     if config()?.key.is_empty() {
         return Ok(Response::text("not set up"));
     }
     let active: Vec<Download> = Database.fetch_all(
-        &format!("SELECT {COLUMNS} FROM downloads WHERE status IN ('downloading','processing') LIMIT 50"),
+        &format!(
+            "SELECT {COLUMNS} FROM downloads WHERE status IN ('downloading','processing') LIMIT 50"
+        ),
         params![],
     )?;
     for row in &active {
         refresh(row)?;
     }
-    let pending: Vec<Id> = Database.fetch_all("SELECT id FROM downloads WHERE status='collecting' ORDER BY created LIMIT 5", params![])?;
+    let pending: Vec<Id> = Database.fetch_all(
+        "SELECT id FROM downloads WHERE status='collecting' ORDER BY created LIMIT 5",
+        params![],
+    )?;
     let started = now();
     for Id { id } in pending {
         if now() - started >= COLLECT_SECONDS {
@@ -470,16 +612,29 @@ struct Page<'a> {
 fn page(request: Request) -> Result<Response> {
     let ctx = request.context();
     let user = ctx.require_user()?;
-    let name = if user.name.trim().is_empty() { &user.username } else { &user.name };
-    secure(Response::render(Page { csrf: ctx.csrf_token(), name })?)
+    let name = if user.name.trim().is_empty() {
+        &user.username
+    } else {
+        &user.name
+    };
+    secure(Response::render(Page {
+        csrf: ctx.csrf_token(),
+        name,
+    })?)
 }
 
 fn script(_: Request) -> Result<Response> {
-    secure(Response::text(include_str!("app.js")).header("content-type", "text/javascript; charset=utf-8")?)
+    secure(
+        Response::text(include_str!("app.js"))
+            .header("content-type", "text/javascript; charset=utf-8")?,
+    )
 }
 
 fn style(_: Request) -> Result<Response> {
-    secure(Response::text(include_str!("app.css")).header("content-type", "text/css; charset=utf-8")?)
+    secure(
+        Response::text(include_str!("app.css"))
+            .header("content-type", "text/css; charset=utf-8")?,
+    )
 }
 
 fn secure(response: Response) -> Result<Response> {
@@ -500,7 +655,11 @@ fn panel(request: Request) -> Result<Response> {
     let mut error = None;
     if let Some(action) = &ctx.panel_action {
         if !admin {
-            return PanelResponse::error(Panel::new(), "Only the app's admins can change these settings.").respond();
+            return PanelResponse::error(
+                Panel::new(),
+                "Only the app's admins can change these settings.",
+            )
+            .respond();
         }
         match panel_action(action) {
             Ok(text) => notice = Some(text),
@@ -510,7 +669,10 @@ fn panel(request: Request) -> Result<Response> {
     let panel = if admin {
         admin_panel()?
     } else {
-        Panel::new().section(Section::new("Media Downloader").text("Open Media Downloader from your LOKI dashboard to save videos and audio."))
+        Panel::new().section(
+            Section::new("Media Downloader")
+                .text("Open Media Downloader from your LOKI dashboard to save videos and audio."),
+        )
     };
     match error {
         Some(error) => PanelResponse::error(panel, error).respond(),
@@ -519,19 +681,30 @@ fn panel(request: Request) -> Result<Response> {
 }
 
 fn panel_action(action: &loki_sdk::PanelAction) -> Result<String> {
-    let field = |key: &str| action.fields.get(key).map(|value| value.trim()).unwrap_or_default();
+    let field = |key: &str| {
+        action
+            .fields
+            .get(key)
+            .map(|value| value.trim())
+            .unwrap_or_default()
+    };
     match action.action.as_str() {
         "save-key" => {
             let key = field("key");
             if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(Error::bad("Paste the 64-character key the worker prints when it starts."));
+                return Err(Error::bad(
+                    "Paste the 64-character key the worker prints when it starts.",
+                ));
             }
             let mut config = config()?;
             config.key = key.to_ascii_lowercase();
             Storage.set_json("config", &config)?;
             match worker("GET", "/health", None) {
                 Ok(_) => Ok("Connected to the worker.".into()),
-                Err(failure) => Err(Error::bad(format!("Saved the key, but the worker didn't accept it yet: {}", failure.message()))),
+                Err(failure) => Err(Error::bad(format!(
+                    "Saved the key, but the worker didn't accept it yet: {}",
+                    failure.message()
+                ))),
             }
         }
         "update" => {
@@ -545,7 +718,9 @@ fn panel_action(action: &loki_sdk::PanelAction) -> Result<String> {
         "refresh" => Ok("Checked the worker again.".into()),
         "limits" => {
             let number = |key: &str, label: &str| -> Result<u32> {
-                field(key).parse().map_err(|_| Error::bad(format!("Enter a whole number for {label}.")))
+                field(key)
+                    .parse()
+                    .map_err(|_| Error::bad(format!("Enter a whole number for {label}.")))
             };
             let keep = number("keep_minutes", "how long files stay ready")?;
             if !(5..=1440).contains(&keep) {
@@ -580,35 +755,59 @@ fn admin_panel() -> Result<Panel> {
             .form("save-key", [Field::new("key", "Worker key", FieldKind::Text)], "Connect")
     };
     if config.key.is_empty() {
-        return Ok(Panel::new().section(setup(Section::new("Set up").warning("Media Downloader isn't connected to its worker yet."))));
+        return Ok(Panel::new().section(setup(
+            Section::new("Set up").warning("Media Downloader isn't connected to its worker yet."),
+        )));
     }
     let status = match worker("GET", "/status", None) {
         Ok(status) => status,
         Err(failure) => {
-            return Ok(Panel::new().section(
-                setup(Section::new("Worker").warning(failure.message()).buttons([Action::new("refresh", "Check again").primary()])),
-            ));
+            return Ok(Panel::new().section(setup(
+                Section::new("Worker")
+                    .warning(failure.message())
+                    .buttons([Action::new("refresh", "Check again").primary()]),
+            )));
         }
     };
     let tools = &status["tools"];
     let version = |tool: &Value| -> Option<String> {
-        tool["version"].as_str().map(|v| v.split('-').next().unwrap_or(v).to_owned())
+        tool["version"]
+            .as_str()
+            .map(|v| v.split('-').next().unwrap_or(v).to_owned())
     };
     let yt_dlp = version(&tools["yt_dlp"]);
     let latest = tools["yt_dlp_latest"].as_str();
     let outdated = tools["update_available"] == true;
     let mut worker_section = Section::new("Worker").stats([
-        ("Worker", status["version"].as_str().unwrap_or("?").to_owned()),
-        ("yt-dlp", yt_dlp.clone().unwrap_or_else(|| "Not installed".into())),
+        (
+            "Worker",
+            status["version"].as_str().unwrap_or("?").to_owned(),
+        ),
+        (
+            "yt-dlp",
+            yt_dlp.clone().unwrap_or_else(|| "Not installed".into()),
+        ),
         ("Newest yt-dlp", latest.unwrap_or("Unknown").to_owned()),
-        ("ffmpeg", version(&tools["ffmpeg"]).unwrap_or_else(|| "Not installed".into())),
-        ("Deno", version(&tools["deno"]).unwrap_or_else(|| "Not installed".into())),
-        ("Downloading now", status["active"].as_u64().unwrap_or(0).to_string()),
+        (
+            "ffmpeg",
+            version(&tools["ffmpeg"]).unwrap_or_else(|| "Not installed".into()),
+        ),
+        (
+            "Deno",
+            version(&tools["deno"]).unwrap_or_else(|| "Not installed".into()),
+        ),
+        (
+            "Downloading now",
+            status["active"].as_u64().unwrap_or(0).to_string(),
+        ),
     ]);
     if yt_dlp.is_none() {
         worker_section = worker_section.warning("yt-dlp isn't installed on the server, or the worker can't find it on its PATH. Install it, then use Check again.");
     } else if outdated {
-        worker_section = worker_section.warning(format!("yt-dlp {} is available. Sites change often, so keep yt-dlp up to date.", latest.unwrap_or("")));
+        worker_section = worker_section.warning(format!(
+            "yt-dlp {} is available. Sites change often, so keep yt-dlp up to date.",
+            latest.unwrap_or("")
+        ));
     } else if latest.is_some() {
         worker_section = worker_section.muted("yt-dlp is up to date.");
     }
@@ -629,11 +828,13 @@ fn admin_panel() -> Result<Panel> {
         worker_section = worker_section.muted("Without ffmpeg, only files that already have sound and picture together are offered. On YouTube that's 360p.");
     }
     if tools["deno"].is_null() {
-        worker_section = worker_section.muted("YouTube needs Deno installed for yt-dlp to read its videos.");
+        worker_section =
+            worker_section.muted("YouTube needs Deno installed for yt-dlp to read its videos.");
     }
     let mut buttons = Vec::new();
     if yt_dlp.is_some() {
-        let update = Action::new("update", "Update yt-dlp").confirm("Update yt-dlp on the server now?");
+        let update =
+            Action::new("update", "Update yt-dlp").confirm("Update yt-dlp on the server now?");
         buttons.push(if outdated { update.primary() } else { update });
     }
     buttons.push(Action::new("refresh", "Check again"));
@@ -644,11 +845,24 @@ fn admin_panel() -> Result<Panel> {
     let limits_section = Section::new("Limits").form(
         "limits",
         [
-            Field::new("max_minutes", "Longest video (minutes)", FieldKind::Number).value(number("max_minutes")),
-            Field::new("max_file_mib", "Largest file (MB)", FieldKind::Number).value(number("max_file_mib")),
-            Field::new("max_active", "Downloads at once", FieldKind::Number).value(number("max_active")),
-            Field::new("max_total_mib", "Worker space for downloads in progress (MB)", FieldKind::Number).value(number("max_total_mib")),
-            Field::new("keep_minutes", "Keep finished files ready for (minutes)", FieldKind::Number).value(config.keep_minutes),
+            Field::new("max_minutes", "Longest video (minutes)", FieldKind::Number)
+                .value(number("max_minutes")),
+            Field::new("max_file_mib", "Largest file (MB)", FieldKind::Number)
+                .value(number("max_file_mib")),
+            Field::new("max_active", "Downloads at once", FieldKind::Number)
+                .value(number("max_active")),
+            Field::new(
+                "max_total_mib",
+                "Worker space for downloads in progress (MB)",
+                FieldKind::Number,
+            )
+            .value(number("max_total_mib")),
+            Field::new(
+                "keep_minutes",
+                "Keep finished files ready for (minutes)",
+                FieldKind::Number,
+            )
+            .value(config.keep_minutes),
         ],
         "Save limits",
     );
@@ -659,8 +873,16 @@ fn admin_panel() -> Result<Panel> {
         .muted("Finished files wait here until they're saved or expire. Raise the quota from Manage in Applications if large files don't fit.");
     let key = Section::new("Worker key")
         .muted("If you made a new key with media-downloader-worker new-key, paste it here.")
-        .form("save-key", [Field::new("key", "Worker key", FieldKind::Text)], "Replace key");
-    Ok(Panel::new().section(worker_section).section(limits_section).section(storage).section(key))
+        .form(
+            "save-key",
+            [Field::new("key", "Worker key", FieldKind::Text)],
+            "Replace key",
+        );
+    Ok(Panel::new()
+        .section(worker_section)
+        .section(limits_section)
+        .section(storage)
+        .section(key))
 }
 
 fn handle(request: Request) -> Result<Response> {

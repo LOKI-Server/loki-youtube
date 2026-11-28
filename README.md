@@ -39,7 +39,8 @@ It has two parts:
    ffmpeg and Deno it found. `media-downloader-worker key` prints the key again,
    and `media-downloader-worker check` shows the tools without starting.
    Keep it running, for example with Task Scheduler at sign-in, a systemd user
-   service or launchd.
+   service or launchd. Stopping it (Ctrl+C, or SIGTERM on Linux and macOS)
+   also stops any yt-dlp it started.
 
 3. **Import the app** in LOKI's **Applications**, grant access to the people or
    groups who should use it, and enable it.
@@ -63,7 +64,9 @@ Set these in the panel:
 | Worker space for downloads in progress | 8192 MB |
 | Keep finished files ready for | 60 minutes |
 
-Each person can have three downloads in progress at a time. Finished files wait
+Each person can have three downloads in progress at a time. A download that
+makes no progress for 12 hours (for example because the worker stopped for
+good) is marked failed. Finished files wait
 in the app's storage on LOKI until they're saved or expire. That storage counts
 against the app's quota, 4096 MB unless you change it from **Manage** in
 Applications.
@@ -72,8 +75,10 @@ Applications.
 
 The worker runs yt-dlp with `--ignore-config`, never follows playlists, and
 leaves out yt-dlp's generic extractor, so only sites yt-dlp specifically
-supports work. Links whose host resolves to the server itself or its local
-network are refused.
+supports work. A pasted link whose host resolves to the server itself or its
+local network is refused. That check covers the link you paste; yt-dlp then
+looks the site up again and follows the site's own redirects, so give the app
+only to people you trust with the server's internet connection.
 
 LOKI gives an app request two minutes, which isn't enough to stream a large video
 through it. So when the worker finishes, the app copies the file into its own
@@ -98,11 +103,10 @@ cargo loki package -p media-downloader
 ```
 
 The worker is `target/release/media-downloader-worker` and the app is
-`target/loki/media-downloader-0.2.0.loki-app`. The app needs LOKI 0.9 or later.
+`target/loki/media-downloader-0.2.1.loki-app`. The app needs LOKI 0.9 or later.
 
 ## Upgrading from the YouTube Downloader
 
 This replaces the earlier YouTube Downloader app and its sandboxed worker.
 It has a new app ID, so import it as a new app, and remove the old app and
-worker. The repository can be renamed to `media-downloader` on GitHub; local
-clones keep working once their remote is updated.
+worker.

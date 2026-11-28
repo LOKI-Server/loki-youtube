@@ -66,7 +66,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Key => println!("{}", key(&data, false)?),
         Command::NewKey => {
             let key = key(&data, true)?;
-            println!("{key}\n\nPaste this key into the Media Downloader panel in LOKI, then restart the worker.");
+            println!(
+                "{key}\n\nPaste this key into the Media Downloader panel in LOKI, then restart the worker."
+            );
         }
         Command::Check => {
             let settings = settings::Store::open(&data)?;
@@ -92,27 +94,63 @@ async fn serve(data: PathBuf) -> anyhow::Result<()> {
     let status = state.0.tools.status(&state.0.settings.get()).await;
     let listener = tokio::net::TcpListener::bind(ADDRESS)
         .await
-        .map_err(|error| anyhow::anyhow!("Could not listen on {ADDRESS}: {error}. Is another worker already running?"))?;
-    println!("Media Downloader worker {} is listening on {ADDRESS}.", env!("CARGO_PKG_VERSION"));
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Could not listen on {ADDRESS}: {error}. Is another worker already running?"
+            )
+        })?;
+    println!(
+        "Media Downloader worker {} is listening on {ADDRESS}.",
+        env!("CARGO_PKG_VERSION")
+    );
     match &status.yt_dlp {
         Some(tool) => println!("yt-dlp {} at {}", tool.version, tool.path),
-        None => println!("yt-dlp was not found. Install it, or set its path in {}.", settings::FILE),
+        None => println!(
+            "yt-dlp was not found. Install it, or set its path in {}.",
+            settings::FILE
+        ),
     }
     match &status.ffmpeg {
         Some(tool) => println!("ffmpeg {}", tool.version),
-        None => println!("ffmpeg was not found, so only files that already have sound and picture together are offered."),
+        None => println!(
+            "ffmpeg was not found, so only files that already have sound and picture together are offered."
+        ),
     }
     println!("\nWorker key (paste it into the Media Downloader panel in LOKI):\n{key}\n");
     let cleaner = tokio::spawn(jobs::maintain(state.clone()));
     let stopping = state.clone();
     axum::serve(listener, web::router(state))
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            stop_signal().await;
             stopping.0.jobs.cancel_all();
         })
         .await?;
     cleaner.abort();
     Ok(())
+}
+
+/// Ctrl+C, or on Unix also SIGTERM (`kill`, launchd, systemd). yt-dlp runs in its
+/// own process group there, so the worker must stop it before exiting.
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn data_dir(path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -152,7 +190,11 @@ fn key(data: &Path, replace: bool) -> anyhow::Result<String> {
             return Ok(key);
         }
     }
-    let key = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    let key = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
     write_private(&path, format!("{key}\n").as_bytes())?;
     Ok(key)
 }
@@ -186,7 +228,10 @@ pub struct Error {
 
 impl Error {
     pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into() }
+        Self {
+            status,
+            message: message.into(),
+        }
     }
     pub fn bad(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
@@ -195,19 +240,29 @@ impl Error {
         Self::new(StatusCode::TOO_MANY_REQUESTS, message)
     }
     pub fn not_found() -> Self {
-        Self::new(StatusCode::NOT_FOUND, "That download is no longer on the worker.")
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "That download is no longer on the worker.",
+        )
     }
 }
 
 impl<E: std::error::Error + Send + Sync + 'static> From<E> for Error {
     fn from(error: E) -> Self {
         tracing::warn!(%error, "request failed");
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "The worker could not finish this request.")
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The worker could not finish this request.",
+        )
     }
 }
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()
+        (
+            self.status,
+            Json(serde_json::json!({ "error": self.message })),
+        )
+            .into_response()
     }
 }

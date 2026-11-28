@@ -51,13 +51,24 @@ impl Tools {
             describe(ffmpeg(settings), &["-version"]),
             describe(find("deno", None), &["--version"]),
         );
-        let latest = if yt_dlp.is_some() { self.latest().await } else { None };
+        let latest = if yt_dlp.is_some() {
+            self.latest().await
+        } else {
+            None
+        };
         let update_available = match (&yt_dlp, &latest) {
             (Some(tool), Some(latest)) => newer(latest, &tool.version),
             _ => false,
         };
         let update = self.update.lock().unwrap().clone();
-        Status { yt_dlp, yt_dlp_latest: latest, update_available, ffmpeg, deno, update }
+        Status {
+            yt_dlp,
+            yt_dlp_latest: latest,
+            update_available,
+            ffmpeg,
+            deno,
+            update,
+        }
     }
 
     /// Starts yt-dlp's own updater in the background. False when one is running.
@@ -67,12 +78,20 @@ impl Tools {
             if update.as_ref().is_some_and(|update| update.running) {
                 return false;
             }
-            *update = Some(Update { running: true, ok: false, output: String::new() });
+            *update = Some(Update {
+                running: true,
+                ok: false,
+                output: String::new(),
+            });
         }
         let tools = self.clone();
         tokio::spawn(async move {
             let (ok, output) = tools.update(&settings).await;
-            *tools.update.lock().unwrap() = Some(Update { running: false, ok, output });
+            *tools.update.lock().unwrap() = Some(Update {
+                running: false,
+                ok,
+                output,
+            });
         });
         true
     }
@@ -94,7 +113,10 @@ impl Tools {
                     .collect();
                 (ok, lines.join("\n").chars().take(800).collect())
             }
-            None => (false, "yt-dlp did not finish updating within three minutes.".into()),
+            None => (
+                false,
+                "yt-dlp did not finish updating within three minutes.".into(),
+            ),
         }
     }
 
@@ -109,7 +131,10 @@ impl Tools {
             tag_name: String,
         }
         let release: Release = reqwest::Client::builder()
-            .user_agent(concat!("media-downloader-worker/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!(
+                "media-downloader-worker/",
+                env!("CARGO_PKG_VERSION")
+            ))
             .timeout(Duration::from_secs(8))
             .build()
             .ok()?
@@ -142,11 +167,17 @@ fn find(name: &str, configured: Option<&Path>) -> Option<PathBuf> {
         return path.is_file().then(|| path.to_owned());
     }
     let names: Vec<String> = if cfg!(windows) {
-        vec![format!("{name}.exe"), format!("{name}.cmd"), name.to_owned()]
+        vec![
+            format!("{name}.exe"),
+            format!("{name}.cmd"),
+            name.to_owned(),
+        ]
     } else {
         vec![name.to_owned()]
     };
-    let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_owned));
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_owned));
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
         .chain(beside)
@@ -167,14 +198,24 @@ async fn describe(path: Option<PathBuf>, args: &[&str]) -> Option<Tool> {
         .next()
         .unwrap_or("unknown")
         .to_owned();
-    Some(Tool { path: path.display().to_string(), version })
+    Some(Tool {
+        path: path.display().to_string(),
+        version,
+    })
 }
 
 /// Runs a tool to completion and returns whether it succeeded, with its output.
 pub async fn run(path: &Path, args: &[&str], limit: Duration) -> Option<(bool, String, String)> {
     let mut command = command(path);
-    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let output = tokio::time::timeout(limit, command.output()).await.ok()?.ok()?;
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = tokio::time::timeout(limit, command.output())
+        .await
+        .ok()?
+        .ok()?;
     Some((
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -195,7 +236,10 @@ pub fn command(path: &Path) -> Command {
 /// are dates, such as `2025.11.12`, and nightlies add a fourth part.
 pub fn newer(latest: &str, current: &str) -> bool {
     let parts = |version: &str| -> Vec<u64> {
-        version.split('.').map(|part| part.parse().unwrap_or(0)).collect()
+        version
+            .split('.')
+            .map(|part| part.parse().unwrap_or(0))
+            .collect()
     };
     let (latest, current) = (parts(latest), parts(current));
     latest[..latest.len().min(3)] > current[..current.len().min(3)]

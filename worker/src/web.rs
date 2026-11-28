@@ -37,14 +37,23 @@ async fn guard(Shared(state): Shared<State>, request: Request, next: Next) -> Re
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .unwrap_or_default();
-    let allowed = headers.get(header::HOST).is_some_and(|host| host == ADDRESS)
+    let allowed = headers
+        .get(header::HOST)
+        .is_some_and(|host| host == ADDRESS)
         && !headers.contains_key(header::ORIGIN)
         && bool::from(key.as_bytes().ct_eq(state.0.key.as_bytes()));
     if !allowed {
-        return Error::new(StatusCode::FORBIDDEN, "The worker key doesn't match. Paste the key the worker prints into the app's panel.").into_response();
+        return Error::new(
+            StatusCode::FORBIDDEN,
+            "The worker key doesn't match. Paste the key the worker prints into the app's panel.",
+        )
+        .into_response();
     }
     let mut response = next.run(request).await;
-    response.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
     response
 }
 
@@ -77,7 +86,9 @@ async fn update(Shared(state): Shared<State>) -> Json<Value> {
 
 async fn limits(Shared(state): Shared<State>, Json(limits): Json<Limits>) -> Result<Json<Value>> {
     let settings = state.0.settings.set_limits(limits)?;
-    Ok(Json(json!({"ok": true, "max_minutes": settings.max_minutes, "max_file_mib": settings.max_file_mib, "max_total_mib": settings.max_total_mib, "max_active": settings.max_active})))
+    Ok(Json(
+        json!({"ok": true, "max_minutes": settings.max_minutes, "max_file_mib": settings.max_file_mib, "max_total_mib": settings.max_total_mib, "max_active": settings.max_active}),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -120,26 +131,41 @@ async fn remove(Shared(state): Shared<State>, Path(id): Path<String>) -> Result<
 }
 
 /// The finished file, whole or one `bytes=START-END` range at a time.
-async fn file(Shared(state): Shared<State>, Path(id): Path<String>, headers: HeaderMap) -> Result<Response> {
+async fn file(
+    Shared(state): Shared<State>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
     valid_id(&id)?;
     let (path, size) = state.0.jobs.file(&id)?;
-    let (start, end) = match headers.get(header::RANGE).and_then(|value| value.to_str().ok()) {
-        Some(range) => range_of(range, size).ok_or_else(|| Error::new(StatusCode::RANGE_NOT_SATISFIABLE, "Invalid range."))?,
+    let (start, end) = match headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(range) => range_of(range, size)
+            .ok_or_else(|| Error::new(StatusCode::RANGE_NOT_SATISFIABLE, "Invalid range."))?,
         None => (0, size.saturating_sub(1)),
     };
     let length = end - start + 1;
     let mut file = tokio::fs::File::open(&path).await?;
     file.seek(std::io::SeekFrom::Start(start)).await?;
-    let body = Body::from_stream(tokio_util::io::ReaderStream::with_capacity(file.take(length), 256 * 1024));
+    let body = Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
+        file.take(length),
+        256 * 1024,
+    ));
     let mut response = Response::new(body);
     let headers = response.headers_mut();
-    headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/octet-stream"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/octet-stream"),
+    );
     headers.insert(header::CONTENT_LENGTH, length.into());
     if start != 0 || end + 1 != size {
         *response.status_mut() = StatusCode::PARTIAL_CONTENT;
         response.headers_mut().insert(
             header::CONTENT_RANGE,
-            header::HeaderValue::from_str(&format!("bytes {start}-{end}/{size}")).map_err(|_| Error::bad("Invalid range."))?,
+            header::HeaderValue::from_str(&format!("bytes {start}-{end}/{size}"))
+                .map_err(|_| Error::bad("Invalid range."))?,
         );
     }
     Ok(response)
@@ -176,11 +202,17 @@ mod tests {
     }
 
     async fn call(state: &State, host: &str, key: &str, origin: bool) -> StatusCode {
-        let mut request = HttpRequest::get("/health").header(header::HOST, host).header(header::AUTHORIZATION, format!("Bearer {key}"));
+        let mut request = HttpRequest::get("/health")
+            .header(header::HOST, host)
+            .header(header::AUTHORIZATION, format!("Bearer {key}"));
         if origin {
             request = request.header(header::ORIGIN, "https://evil.test");
         }
-        router(state.clone()).oneshot(request.body(Body::empty()).unwrap()).await.unwrap().status()
+        router(state.clone())
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
     }
 
     #[tokio::test]
@@ -188,9 +220,18 @@ mod tests {
         let (_dir, state) = state();
         let key = "a".repeat(64);
         assert_eq!(call(&state, ADDRESS, &key, false).await, StatusCode::OK);
-        assert_eq!(call(&state, ADDRESS, &"b".repeat(64), false).await, StatusCode::FORBIDDEN);
-        assert_eq!(call(&state, "localhost:44317", &key, false).await, StatusCode::FORBIDDEN);
-        assert_eq!(call(&state, ADDRESS, &key, true).await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            call(&state, ADDRESS, &"b".repeat(64), false).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(&state, "localhost:44317", &key, false).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(&state, ADDRESS, &key, true).await,
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[test]

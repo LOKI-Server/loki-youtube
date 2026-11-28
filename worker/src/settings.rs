@@ -83,7 +83,10 @@ impl Store {
         settings
             .validate()
             .map_err(|error| anyhow::anyhow!("{}: {}", path.display(), error.message))?;
-        Ok(Self { path, current: RwLock::new(settings) })
+        Ok(Self {
+            path,
+            current: RwLock::new(settings),
+        })
     }
 
     pub fn get(&self) -> Settings {
@@ -97,7 +100,8 @@ impl Store {
         next.max_total_mib = limits.max_total_mib;
         next.max_active = limits.max_active;
         next.validate()?;
-        let bytes = serde_json::to_vec_pretty(&next).map_err(|_| Error::bad("Invalid settings."))?;
+        let bytes =
+            serde_json::to_vec_pretty(&next).map_err(|_| Error::bad("Invalid settings."))?;
         let temporary = self.path.with_extension("json.tmp");
         std::fs::write(&temporary, bytes)?;
         std::fs::rename(&temporary, &self.path)?;

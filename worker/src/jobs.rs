@@ -27,6 +27,9 @@ const MIB: u64 = 1024 * 1024;
 pub struct Jobs {
     root: PathBuf,
     live: Mutex<HashMap<String, Job>>,
+    /// Held while a download is checked against the limits and started, so two
+    /// requests at once can't both squeeze under them.
+    starting: tokio::sync::Mutex<()>,
 }
 
 struct Job {
@@ -68,7 +71,11 @@ impl Jobs {
             std::fs::remove_dir_all(&root)?;
         }
         std::fs::create_dir_all(&root)?;
-        Ok(Self { root, live: Mutex::new(HashMap::new()) })
+        Ok(Self {
+            root,
+            live: Mutex::new(HashMap::new()),
+            starting: tokio::sync::Mutex::new(()),
+        })
     }
 
     pub fn view(&self, id: &str) -> Result<View> {
@@ -95,7 +102,10 @@ impl Jobs {
         job.touched = Instant::now();
         match (&job.status, &job.file) {
             (Status::Ready, Some(file)) => Ok((file.clone(), job.size)),
-            _ => Err(Error::new(StatusCode::CONFLICT, "That download is not finished yet.")),
+            _ => Err(Error::new(
+                StatusCode::CONFLICT,
+                "That download is not finished yet.",
+            )),
         }
     }
 
@@ -187,9 +197,16 @@ pub async fn inspect(state: &State, raw: &str) -> Result<Value> {
     // LOKI gives the app 30 seconds for an answer, so the lookup has a little less.
     let output = tokio::time::timeout(Duration::from_secs(27), command.output())
         .await
-        .map_err(|_| Error::new(StatusCode::GATEWAY_TIMEOUT, "Looking up that link took too long. Try again."))??;
+        .map_err(|_| {
+            Error::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "Looking up that link took too long. Try again.",
+            )
+        })??;
     if !output.status.success() {
-        return Err(Error::bad(explain(&String::from_utf8_lossy(&output.stderr))));
+        return Err(Error::bad(explain(&String::from_utf8_lossy(
+            &output.stderr,
+        ))));
     }
     let info: Value = serde_json::from_slice(&output.stdout)
         .map_err(|_| Error::bad("yt-dlp returned something unexpected for that link."))?;
@@ -199,10 +216,19 @@ pub async fn inspect(state: &State, raw: &str) -> Result<Value> {
 /// The part of [`inspect`] that reads yt-dlp's answer, kept apart for tests.
 fn describe(info: &Value, settings: &Settings, merge: bool, asked: &str) -> Result<Value> {
     if matches!(info["_type"].as_str(), Some("playlist" | "multi_video")) {
-        return Err(Error::bad("That link is a playlist or channel. Paste a link to one video."));
+        return Err(Error::bad(
+            "That link is a playlist or channel. Paste a link to one video.",
+        ));
     }
-    if info["is_live"] == true || matches!(info["live_status"].as_str(), Some("is_live" | "is_upcoming")) {
-        return Err(Error::bad("Live streams and premieres can't be downloaded until they have ended."));
+    if info["is_live"] == true
+        || matches!(
+            info["live_status"].as_str(),
+            Some("is_live" | "is_upcoming")
+        )
+    {
+        return Err(Error::bad(
+            "Live streams and premieres can't be downloaded until they have ended.",
+        ));
     }
     let duration = info["duration"].as_f64();
     if duration.is_some_and(|seconds| seconds > f64::from(settings.max_minutes) * 60.0) {
@@ -213,12 +239,23 @@ fn describe(info: &Value, settings: &Settings, merge: bool, asked: &str) -> Resu
     }
     let choices = choices(info, merge);
     if choices.is_empty() {
-        return Err(Error::bad("No downloadable video or audio was found at that link."));
+        return Err(Error::bad(
+            "No downloadable video or audio was found at that link.",
+        ));
     }
     let text = |key: &str, limit: usize| -> String {
-        info[key].as_str().unwrap_or_default().chars().filter(|c| !c.is_control()).take(limit).collect()
+        info[key]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(limit)
+            .collect()
     };
-    let url = info["webpage_url"].as_str().filter(|url| url.starts_with("http")).unwrap_or(asked);
+    let url = info["webpage_url"]
+        .as_str()
+        .filter(|url| url.starts_with("http"))
+        .unwrap_or(asked);
     Ok(json!({
         "url": url,
         "title": Some(text("title", 300)).filter(|title| !title.is_empty()).unwrap_or_else(|| "Untitled".into()),
@@ -245,22 +282,53 @@ fn choices(info: &Value, merge: bool) -> Vec<Choice> {
     let empty = Vec::new();
     let formats = info["formats"].as_array().unwrap_or(&empty);
     let codec = |format: &Value, key: &str| format[key].as_str() != Some("none");
-    let size = |format: &Value| format["filesize"].as_u64().or_else(|| format["filesize_approx"].as_u64());
-    let height = |format: &Value| format["height"].as_u64().filter(|height| (1..=8640).contains(height));
-    let video: Vec<&Value> = formats.iter().filter(|f| codec(f, "vcodec") && height(f).is_some()).collect();
-    let audio_only: Vec<&Value> = formats.iter().filter(|f| !codec(f, "vcodec") && codec(f, "acodec")).collect();
-    let combined: Vec<&Value> = video.iter().copied().filter(|f| codec(f, "acodec")).collect();
+    let size = |format: &Value| {
+        format["filesize"]
+            .as_u64()
+            .or_else(|| format["filesize_approx"].as_u64())
+    };
+    let height = |format: &Value| {
+        format["height"]
+            .as_u64()
+            .filter(|height| (1..=8640).contains(height))
+    };
+    let video: Vec<&Value> = formats
+        .iter()
+        .filter(|f| codec(f, "vcodec") && height(f).is_some())
+        .collect();
+    let audio_only: Vec<&Value> = formats
+        .iter()
+        .filter(|f| !codec(f, "vcodec") && codec(f, "acodec"))
+        .collect();
+    let combined: Vec<&Value> = video
+        .iter()
+        .copied()
+        .filter(|f| codec(f, "acodec"))
+        .collect();
     let best_audio = audio_only.iter().filter_map(|f| size(f)).max();
 
     let mut out = Vec::new();
     if formats.is_empty() && info["url"].is_string() {
-        out.push(Choice { id: "best".into(), label: "Best available".into(), size: size(info) });
+        out.push(Choice {
+            id: "best".into(),
+            label: "Best available".into(),
+            size: size(info),
+        });
         return out;
     }
     let sources = if merge { &video } else { &combined };
     let heights: BTreeSet<u64> = sources.iter().filter_map(|f| height(f)).collect();
-    if !sources.is_empty() || (!merge && formats.iter().any(|f| codec(f, "vcodec") && codec(f, "acodec"))) {
-        out.push(Choice { id: "best".into(), label: "Best available".into(), size: None });
+    if !sources.is_empty()
+        || (!merge
+            && formats
+                .iter()
+                .any(|f| codec(f, "vcodec") && codec(f, "acodec")))
+    {
+        out.push(Choice {
+            id: "best".into(),
+            label: "Best available".into(),
+            size: None,
+        });
     }
     for &h in heights.iter().rev().take(8) {
         // The largest file at this height stands in for what "best" picks.
@@ -269,16 +337,36 @@ fn choices(info: &Value, merge: bool) -> Vec<Choice> {
             .filter(|f| height(f) == Some(h))
             .filter_map(|f| {
                 let bytes = size(f)?;
-                Some(if merge && !codec(f, "acodec") { bytes + best_audio.unwrap_or(0) } else { bytes })
+                Some(if merge && !codec(f, "acodec") {
+                    bytes + best_audio.unwrap_or(0)
+                } else {
+                    bytes
+                })
             })
             .max();
-        out.push(Choice { id: format!("v{h}"), label: quality(h), size: estimate });
+        out.push(Choice {
+            id: format!("v{h}"),
+            label: quality(h),
+            size: estimate,
+        });
     }
     if merge && (!audio_only.is_empty() || !combined.is_empty()) {
-        out.push(Choice { id: "mp3".into(), label: "Audio only · MP3".into(), size: best_audio });
-        out.push(Choice { id: "m4a".into(), label: "Audio only · M4A".into(), size: best_audio });
+        out.push(Choice {
+            id: "mp3".into(),
+            label: "Audio only · MP3".into(),
+            size: best_audio,
+        });
+        out.push(Choice {
+            id: "m4a".into(),
+            label: "Audio only · M4A".into(),
+            size: best_audio,
+        });
     } else if !audio_only.is_empty() {
-        out.push(Choice { id: "audio".into(), label: "Audio only".into(), size: best_audio });
+        out.push(Choice {
+            id: "audio".into(),
+            label: "Audio only".into(),
+            size: best_audio,
+        });
     }
     out
 }
@@ -296,18 +384,37 @@ fn quality(height: u64) -> String {
 fn selection(choice: &str, merge: bool) -> Result<Vec<String>> {
     let unknown = || Error::bad("Choose one of the offered qualities.");
     let video = |filter: &str| -> Vec<String> {
-        let format = if merge { format!("bv*{filter}+ba/b{filter}") } else { format!("b{filter}") };
+        let format = if merge {
+            format!("bv*{filter}+ba/b{filter}")
+        } else {
+            format!("b{filter}")
+        };
         // At the same size and frame rate, prefer H.264 and AAC, which merge into an
         // MP4 that plays everywhere. Higher qualities that only exist as VP9 or AV1
         // are still chosen, and land in MKV when MP4 can't hold them.
-        vec!["-f".into(), format, "-S".into(), "res,fps,vcodec:h264,acodec:aac".into()]
+        vec![
+            "-f".into(),
+            format,
+            "-S".into(),
+            "res,fps,vcodec:h264,acodec:aac".into(),
+        ]
     };
     Ok(match choice {
         "best" => video(""),
-        "mp3" | "m4a" if merge => vec!["-f".into(), "ba/b".into(), "-x".into(), "--audio-format".into(), choice.into()],
+        "mp3" | "m4a" if merge => vec![
+            "-f".into(),
+            "ba/b".into(),
+            "-x".into(),
+            "--audio-format".into(),
+            choice.into(),
+        ],
         "audio" => vec!["-f".into(), "ba".into()],
         _ => {
-            let height: u32 = choice.strip_prefix('v').and_then(|h| h.parse().ok()).filter(|h| (1..=8640).contains(h)).ok_or_else(unknown)?;
+            let height: u32 = choice
+                .strip_prefix('v')
+                .and_then(|h| h.parse().ok())
+                .filter(|h| (1..=8640).contains(h))
+                .ok_or_else(unknown)?;
             video(&format!("[height<={height}]"))
         }
     })
@@ -320,18 +427,29 @@ pub async fn start(state: &State, raw: &str, choice: &str) -> Result<String> {
     let yt_dlp = tools::yt_dlp(&settings).ok_or_else(missing)?;
     let ffmpeg = tools::ffmpeg(&settings);
     let mut args = selection(choice, ffmpeg.is_some())?;
+    let _starting = state.0.jobs.starting.lock().await;
     if state.0.jobs.active() >= settings.max_active as usize {
-        return Err(Error::busy("The server is already downloading as much as it allows. Try again in a moment."));
+        return Err(Error::busy(
+            "The server is already downloading as much as it allows. Try again in a moment.",
+        ));
     }
-    if state.0.jobs.usage() + u64::from(settings.max_file_mib) * MIB > u64::from(settings.max_total_mib) * MIB {
-        return Err(Error::busy("The server's download space is full. Try again once other downloads are collected."));
+    if state.0.jobs.usage() + u64::from(settings.max_file_mib) * MIB
+        > u64::from(settings.max_total_mib) * MIB
+    {
+        return Err(Error::busy(
+            "The server's download space is full. Try again once other downloads are collected.",
+        ));
     }
     let id = uuid::Uuid::new_v4().to_string();
     let folder = state.0.jobs.root.join(&id);
     tokio::fs::create_dir_all(&folder).await?;
     if let Some(ffmpeg) = &ffmpeg {
         args.extend(["--ffmpeg-location".into(), ffmpeg.display().to_string()]);
-        args.extend(["--merge-output-format".into(), "mp4/mkv".into(), "--embed-metadata".into()]);
+        args.extend([
+            "--merge-output-format".into(),
+            "mp4/mkv".into(),
+            "--embed-metadata".into(),
+        ]);
     }
     args.extend([
         "--max-filesize".into(),
@@ -357,7 +475,13 @@ pub async fn start(state: &State, raw: &str, choice: &str) -> Result<String> {
         .stderr(Stdio::piped());
     #[cfg(unix)]
     command.process_group(0);
-    let child = command.spawn()?;
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = tokio::fs::remove_dir_all(&folder).await;
+            return Err(error.into());
+        }
+    };
     let cancel = CancellationToken::new();
     state.0.jobs.live.lock().unwrap().insert(
         id.clone(),
@@ -371,30 +495,50 @@ pub async fn start(state: &State, raw: &str, choice: &str) -> Result<String> {
             cancel: cancel.clone(),
         },
     );
-    tokio::spawn(run(state.clone(), id.clone(), folder, child, cancel, settings));
+    tokio::spawn(run(
+        state.clone(),
+        id.clone(),
+        folder,
+        child,
+        cancel,
+        settings,
+    ));
     Ok(id)
 }
 
-async fn run(state: State, id: String, folder: PathBuf, mut child: tokio::process::Child, cancel: CancellationToken, settings: Settings) {
+async fn run(
+    state: State,
+    id: String,
+    folder: PathBuf,
+    mut child: tokio::process::Child,
+    cancel: CancellationToken,
+    settings: Settings,
+) {
     let group = Group::contain(&child);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let jobs = &state.0.jobs;
     // yt-dlp reports progress on stdout and problems on stderr.
     let progress = async {
-        let Some(stdout) = stdout else { return String::new() };
+        let Some(stdout) = stdout else {
+            return String::new();
+        };
         let mut lines = BufReader::new(stdout).lines();
         let mut notes = String::new();
         while let Ok(Some(line)) = lines.next_line().await {
             if let Some(rest) = line.strip_prefix("[progress] ") {
-                let numbers: Vec<Option<f64>> = rest.split_whitespace().map(|n| n.parse().ok()).collect();
-                if let [Some(done), total, estimate] = numbers[..] {
-                    if let Some(total) = total.or(estimate).filter(|total| *total > 0.0) {
-                        let percent = (done / total * 100.0).clamp(0.0, 100.0) as f32;
-                        jobs.update(&id, |job| job.percent = Some(percent));
-                    }
+                let numbers: Vec<Option<f64>> =
+                    rest.split_whitespace().map(|n| n.parse().ok()).collect();
+                if let [Some(done), total, estimate] = numbers[..]
+                    && let Some(total) = total.or(estimate).filter(|total| *total > 0.0)
+                {
+                    let percent = (done / total * 100.0).clamp(0.0, 100.0) as f32;
+                    jobs.update(&id, |job| job.percent = Some(percent));
                 }
-            } else if line.starts_with("[Merger]") || line.starts_with("[ExtractAudio]") || line.starts_with("[Metadata]") {
+            } else if line.starts_with("[Merger]")
+                || line.starts_with("[ExtractAudio]")
+                || line.starts_with("[Metadata]")
+            {
                 jobs.update(&id, |job| {
                     job.status = Status::Processing;
                     job.percent = None;
@@ -437,16 +581,28 @@ async fn run(state: State, id: String, folder: PathBuf, mut child: tokio::proces
     let result = match (exit, finished) {
         (Ok(status), Some((file, size))) if status.success() => {
             if size > u64::from(settings.max_file_mib) * MIB {
-                Err(format!("The file is larger than this server allows ({} MB).", settings.max_file_mib))
+                Err(format!(
+                    "The file is larger than this server allows ({} MB).",
+                    settings.max_file_mib
+                ))
             } else {
                 Ok((file, size))
             }
         }
         (Ok(status), _) if status.success() && notes.contains("does not pass filter") => {
-            Err(format!("That video is longer than this server allows ({} minutes).", settings.max_minutes))
+            Err(format!(
+                "That video is longer than this server allows ({} minutes).",
+                settings.max_minutes
+            ))
         }
-        (Ok(status), _) if status.success() && (notes.contains("max-filesize") || notes.contains("larger than max")) => {
-            Err(format!("The file is larger than this server allows ({} MB).", settings.max_file_mib))
+        (Ok(status), _)
+            if status.success()
+                && (notes.contains("max-filesize") || notes.contains("larger than max")) =>
+        {
+            Err(format!(
+                "The file is larger than this server allows ({} MB).",
+                settings.max_file_mib
+            ))
         }
         _ => Err(explain(&problems)),
     };
@@ -477,7 +633,9 @@ fn finished_file(folder: &Path) -> Option<(PathBuf, u64)> {
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
             let meta = entry.metadata().ok()?;
-            let partial = [".part", ".ytdl", ".temp", ".tmp"].iter().any(|end| name.contains(end));
+            let partial = [".part", ".ytdl", ".temp", ".tmp"]
+                .iter()
+                .any(|end| name.contains(end));
             (meta.is_file() && name.starts_with("media.") && !partial && meta.len() > 0)
                 .then(|| (entry.path(), meta.len()))
         })
@@ -514,7 +672,14 @@ fn explain(stderr: &str) -> String {
         .lines()
         .rev()
         .find_map(|line| line.trim().strip_prefix("ERROR: "))
-        .unwrap_or_else(|| stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or_default().trim());
+        .unwrap_or_else(|| {
+            stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or_default()
+                .trim()
+        });
     let lower = error.to_ascii_lowercase();
     if lower.contains("unsupported url") {
         return "That site isn't supported. yt-dlp lists the sites it supports.".into();
@@ -522,18 +687,28 @@ fn explain(stderr: &str) -> String {
     if lower.contains("sign in") || lower.contains("login") || lower.contains("cookies") {
         return "That site wants a signed-in account for this video, so it can't be downloaded here.".into();
     }
-    if lower.contains("private video") || lower.contains("video unavailable") || lower.contains("not available") {
-        return "That video is private, removed, or not available from the server's location.".into();
+    if lower.contains("private video")
+        || lower.contains("video unavailable")
+        || lower.contains("not available")
+    {
+        return "That video is private, removed, or not available from the server's location."
+            .into();
     }
     if lower.contains("http error 429") || lower.contains("too many requests") {
         return "The site is limiting requests from this server. Try again later.".into();
     }
     // Drop yt-dlp's "[extractor] id: " prefix and keep the message short.
     let message = match error.split_once("] ") {
-        Some((head, rest)) if head.starts_with('[') => rest.split_once(": ").map_or(rest, |(_, after)| after),
+        Some((head, rest)) if head.starts_with('[') => {
+            rest.split_once(": ").map_or(rest, |(_, after)| after)
+        }
         _ => error,
     };
-    let message: String = message.chars().filter(|c| !c.is_control()).take(300).collect();
+    let message: String = message
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(300)
+        .collect();
     if message.is_empty() {
         "yt-dlp could not download that link.".into()
     } else {
@@ -550,7 +725,10 @@ pub async fn check_url(raw: &str) -> Result<url::Url> {
         return Err(invalid());
     }
     let url = url::Url::parse(raw).map_err(|_| invalid())?;
-    if !matches!(url.scheme(), "https" | "http") || !url.username().is_empty() || url.password().is_some() {
+    if !matches!(url.scheme(), "https" | "http")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         return Err(invalid());
     }
     let private = || Error::bad("Links to this server or its local network aren't allowed.");
@@ -559,12 +737,15 @@ pub async fn check_url(raw: &str) -> Result<url::Url> {
         url::Host::Ipv6(ip) => vec![IpAddr::V6(ip)],
         url::Host::Domain(domain) => {
             let port = url.port_or_known_default().unwrap_or(443);
-            tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((domain, port)))
-                .await
-                .map_err(|_| Error::bad("Looking up that website took too long."))?
-                .map_err(|_| Error::bad("Couldn't find that website. Check the link."))?
-                .map(|socket| socket.ip())
-                .collect()
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::net::lookup_host((domain, port)),
+            )
+            .await
+            .map_err(|_| Error::bad("Looking up that website took too long."))?
+            .map_err(|_| Error::bad("Couldn't find that website. Check the link."))?
+            .map(|socket| socket.ip())
+            .collect()
         }
     };
     if addresses.is_empty() || !addresses.into_iter().all(public) {
@@ -614,11 +795,15 @@ impl Group {
     fn contain(child: &tokio::process::Child) -> Self {
         #[cfg(windows)]
         {
-            Self { _job: windows_job(child) }
+            Self {
+                _job: windows_job(child),
+            }
         }
         #[cfg(unix)]
         {
-            Self { pid: child.id().map(|pid| pid as i32) }
+            Self {
+                pid: child.id().map(|pid| pid as i32),
+            }
         }
         #[cfg(not(any(windows, unix)))]
         {
@@ -678,15 +863,21 @@ mod tests {
             video(360, "avc1", "mp4a", 10), video(1080, "avc1", "none", 100), video(2160, "vp9", "none", 400),
             {"vcodec": "none", "acodec": "opus", "filesize": 5},
         ]});
-        let ids: Vec<_> = choices(&info, true).into_iter().map(|c| (c.id, c.label, c.size)).collect();
-        assert_eq!(ids, vec![
-            ("best".into(), "Best available".into(), None),
-            ("v2160".into(), "4K".into(), Some(405)),
-            ("v1080".into(), "1080p".into(), Some(105)),
-            ("v360".into(), "360p".into(), Some(10)),
-            ("mp3".into(), "Audio only · MP3".into(), Some(5)),
-            ("m4a".into(), "Audio only · M4A".into(), Some(5)),
-        ]);
+        let ids: Vec<_> = choices(&info, true)
+            .into_iter()
+            .map(|c| (c.id, c.label, c.size))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("best".into(), "Best available".into(), None),
+                ("v2160".into(), "4K".into(), Some(405)),
+                ("v1080".into(), "1080p".into(), Some(105)),
+                ("v360".into(), "360p".into(), Some(10)),
+                ("mp3".into(), "Audio only · MP3".into(), Some(5)),
+                ("m4a".into(), "Audio only · M4A".into(), Some(5)),
+            ]
+        );
     }
 
     #[test]
@@ -699,9 +890,22 @@ mod tests {
     #[test]
     fn selections_match_choices_and_reject_anything_else() {
         let sort = ["-S", "res,fps,vcodec:h264,acodec:aac"];
-        assert_eq!(selection("v720", true).unwrap(), [["-f", "bv*[height<=720]+ba/b[height<=720]"].as_slice(), &sort].concat());
-        assert_eq!(selection("v720", false).unwrap(), [["-f", "b[height<=720]"].as_slice(), &sort].concat());
-        assert_eq!(selection("mp3", true).unwrap(), ["-f", "ba/b", "-x", "--audio-format", "mp3"]);
+        assert_eq!(
+            selection("v720", true).unwrap(),
+            [
+                ["-f", "bv*[height<=720]+ba/b[height<=720]"].as_slice(),
+                &sort
+            ]
+            .concat()
+        );
+        assert_eq!(
+            selection("v720", false).unwrap(),
+            [["-f", "b[height<=720]"].as_slice(), &sort].concat()
+        );
+        assert_eq!(
+            selection("mp3", true).unwrap(),
+            ["-f", "ba/b", "-x", "--audio-format", "mp3"]
+        );
         for bad in ["mp3", "v0", "v99999", "--exec", "v720;rm"] {
             assert!(selection(bad, false).is_err(), "{bad}");
         }
@@ -709,11 +913,21 @@ mod tests {
 
     #[test]
     fn playlists_live_streams_and_long_videos_are_refused() {
-        let settings = Settings { max_minutes: 10, ..Settings::default() };
-        let refused = |info: Value| describe(&info, &settings, true, "https://example.com").unwrap_err().message;
+        let settings = Settings {
+            max_minutes: 10,
+            ..Settings::default()
+        };
+        let refused = |info: Value| {
+            describe(&info, &settings, true, "https://example.com")
+                .unwrap_err()
+                .message
+        };
         assert!(refused(json!({"_type": "playlist"})).contains("playlist"));
         assert!(refused(json!({"is_live": true})).contains("Live"));
-        assert!(refused(json!({"duration": 601.0, "formats": [video(720, "avc1", "mp4a", 1)]})).contains("10 minutes"));
+        assert!(
+            refused(json!({"duration": 601.0, "formats": [video(720, "avc1", "mp4a", 1)]}))
+                .contains("10 minutes")
+        );
         let ok = describe(&json!({"title": "Hi\u{7}", "duration": 30.0, "extractor_key": "Youtube", "webpage_url_domain": "youtube.com", "formats": [video(720, "avc1", "mp4a", 1)]}), &settings, true, "https://example.com").unwrap();
         assert_eq!(ok["title"], "Hi");
         assert_eq!(ok["site"], "youtube.com");
@@ -721,14 +935,32 @@ mod tests {
 
     #[test]
     fn errors_read_as_plain_sentences() {
-        assert_eq!(explain("ERROR: Unsupported URL: https://x.test/\n"), "That site isn't supported. yt-dlp lists the sites it supports.");
-        assert!(explain("WARNING: x\nERROR: [youtube] abc: Sign in to confirm you're not a bot").contains("signed-in"));
-        assert_eq!(explain("ERROR: [vimeo] 123: Something odd happened"), "yt-dlp couldn't download it: Something odd happened");
+        assert_eq!(
+            explain("ERROR: Unsupported URL: https://x.test/\n"),
+            "That site isn't supported. yt-dlp lists the sites it supports."
+        );
+        assert!(
+            explain("WARNING: x\nERROR: [youtube] abc: Sign in to confirm you're not a bot")
+                .contains("signed-in")
+        );
+        assert_eq!(
+            explain("ERROR: [vimeo] 123: Something odd happened"),
+            "yt-dlp couldn't download it: Something odd happened"
+        );
     }
 
     #[tokio::test]
     async fn links_to_the_local_network_are_refused() {
-        for url in ["http://127.0.0.1/", "http://192.168.1.10/x", "http://[::1]/", "https://[::ffff:10.0.0.1]/", "http://localhost:8080/", "file:///etc/passwd", "https://user:pw@example.com/", "ftp://example.com/"] {
+        for url in [
+            "http://127.0.0.1/",
+            "http://192.168.1.10/x",
+            "http://[::1]/",
+            "https://[::ffff:10.0.0.1]/",
+            "http://localhost:8080/",
+            "file:///etc/passwd",
+            "https://user:pw@example.com/",
+            "ftp://example.com/",
+        ] {
             assert!(check_url(url).await.is_err(), "{url}");
         }
         assert!(public("8.8.8.8".parse().unwrap()));
